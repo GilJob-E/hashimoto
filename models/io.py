@@ -33,7 +33,7 @@ class EmergentSlotData(BaseModel):
 class AbductionResult(BaseModel):
     observed_gap: str
     abductive_hypothesis: str
-    parent_slot_id: str  # 이 emergent_slot이 보완하는 부모 슬롯의 ID
+    parent_slot_id: Optional[str] = None  # 이 emergent_slot이 보완하는 부모 슬롯의 ID
     emergent_slot: EmergentSlotData
 
 
