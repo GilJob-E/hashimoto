@@ -2,7 +2,7 @@
 Hashimoto Engine 대화형 테스트 콘솔.
 
 두 가지 모드:
-  1. 실제 LLM 모드  — Anthropic API를 직접 호출 (크레딧 필요)
+  1. 실제 LLM 모드  — Gemini API를 직접 호출 (크레딧 필요)
   2. 수동 입력 모드 — LLM에 보낼 프롬프트를 출력하고, 사용자가 JSON 응답을 직접 입력
 """
 
@@ -16,6 +16,7 @@ from engine.hashimoto import HashimotoEngine
 from engine.state import (
     PRUNE_DEPTH_THRESHOLD,
     MIN_PRUNE_DEPTH_THRESHOLD,
+    TOPIC_QUESTION_THRESHOLD,
     effective_depth_threshold,
 )
 from llm.prompts import build_system_prompt, build_turn_message
@@ -112,11 +113,17 @@ _SCHEMA_HINT = """\
   ┌ 출력 스키마 참고 ──────────────────────────────────────────────
   │ {
   │   "slot_evaluations": [
-  │     {"slot_id": "<현재 슬롯 ID>", "fulfillment_score": 0.0~1.0, "evidence": "근거"}
+  │     {
+  │       "slot_id": "<현재 슬롯 ID>",
+  │       "fulfillment_score": 0.0~1.0,
+  │       "evidence": "근거",
+  │       "response_type": "ANSWERED|INSUFFICIENT|REFUSED"
+  │     }
   │   ],
   │   "abduction": {               ← 필요 없으면 null
   │     "observed_gap": "...",
   │     "abductive_hypothesis": "...",
+  │     "parent_slot_id": "<부모 슬롯 ID>",
   │     "emergent_slot": {
   │       "slot_id": "snake_case_id",
   │       "proposition_statement": "검증할 명제",
@@ -125,8 +132,7 @@ _SCHEMA_HINT = """\
   │     }
   │   },
   │   "state_commands": {
-  │     "stack_action": "PUSH|POP|NONE|PRUNE",
-  │     "pop_count": 0,
+  │     "stack_action": "PUSH|NONE|PRUNE",
   │     "depth_increment": 1,
   │     "slots_to_pop": ["<검증된 슬롯 ID>"]
   │   },
@@ -262,7 +268,7 @@ class MockHashimotoEngine(HashimotoEngine):
 def select_mode() -> str:
     print(f"\n{DSEP}\n  {bold('Hashimoto Engine — 테스트 콘솔')}\n{DSEP}")
     print("\n실행 모드:")
-    print(f"  {cyan('1')}. 실제 LLM 모드   — Anthropic API 호출 (크레딧 필요)")
+    print(f"  {cyan('1')}. 실제 LLM 모드   — Gemini API 호출 (크레딧 필요)")
     print(f"  {cyan('2')}. 수동 입력 모드  — 내가 LLM 역할 (API 불필요)")
     while True:
         c = input("\n선택 [1/2]: ").strip()
@@ -349,8 +355,12 @@ def show_state_brief(engine: HashimotoEngine, anxiety: float = 50.0) -> None:
     depth_disp = f"{s.depth_counter} / {t}"
     if t < PRUNE_DEPTH_THRESHOLD:
         depth_disp += yellow(f"  (anxiety={anxiety:.0f}로 {PRUNE_DEPTH_THRESHOLD}→{t} 조정)")
+    tqc_disp = f"{s.topic_question_counter} / {TOPIC_QUESTION_THRESHOLD}"
+    if s.topic_question_counter >= TOPIC_QUESTION_THRESHOLD:
+        tqc_disp += red("  ← 주제 전환 임계값 도달")
     print(f"  주제        : {bold(s.root_topic)}")
     print(f"  Depth       : {depth_disp}")
+    print(f"  주제 질문수 : {tqc_disp}")
     stack_disp = " → ".join(s.priority_stack) if s.priority_stack else dim("(비어있음)")
     print(f"  Stack({len(s.priority_stack):02d})   : {stack_disp}")
     remaining = engine.remaining_topics
@@ -363,10 +373,12 @@ def show_slot_evaluations(engine: HashimotoEngine) -> None:
         print(f"  {dim('(평가된 슬롯 없음)')}")
         return
     for ev in analysis.slot_evaluations:
-        verified = green("  ✓ VERIFIED → pop 대상") if ev.fulfillment_score >= 0.7 else ""
+        rt = ev.response_type
+        rt_color = green if rt == "ANSWERED" else (yellow if rt == "INSUFFICIENT" else red)
         print(f"\n  {bold(ev.slot_id)}")
-        print(f"    score  : {score_bar(ev.fulfillment_score)}{verified}")
-        print(f"    근거   : {dim(ev.evidence)}")
+        print(f"    score        : {score_bar(ev.fulfillment_score)}")
+        print(f"    response_type: {rt_color(rt)}")
+        print(f"    근거         : {dim(ev.evidence)}")
 
 
 def show_abduction(engine: HashimotoEngine) -> None:
@@ -380,6 +392,8 @@ def show_abduction(engine: HashimotoEngine) -> None:
     es = ab.emergent_slot
     print(f"  공백     : {ab.observed_gap}")
     print(f"  가설     : {dim(ab.abductive_hypothesis)}")
+    if ab.parent_slot_id:
+        print(f"  부모슬롯 : {dim(ab.parent_slot_id)}")
     print(f"  신규슬롯 : {magenta(es.slot_id)}")
     print(f"  명제     : {es.proposition_statement}")
     print(f"  깊이     : {es.expected_answer_depth}")
@@ -394,7 +408,7 @@ def show_state_commands(engine: HashimotoEngine) -> None:
     if not analysis:
         return
     cmd = analysis.state_commands
-    color_map = {"PUSH": magenta, "POP": yellow, "PRUNE": red, "NONE": dim}
+    color_map = {"PUSH": magenta, "PRUNE": red, "NONE": dim}
     action_fn = color_map.get(cmd.stack_action.upper(), str)
     print(f"  stack_action    : {action_fn(cmd.stack_action)}")
     print(f"  depth_increment : {cmd.depth_increment}")
@@ -428,6 +442,10 @@ def show_prune_verdict(engine: HashimotoEngine, before: dict, anxiety: float) ->
         print(f"  판정                : {red('LLM PRUNE 발동')}")
     elif trigger == "system":
         print(f"  판정                : {red('시스템 강제 PRUNE')}  (depth {depth_was} ≥ threshold {threshold})")
+    elif trigger == "depth":
+        print(f"  판정                : {yellow('Depth PRUNE')}  (depth {depth_was} ≥ threshold {threshold})")
+    elif trigger == "topic_count":
+        print(f"  판정                : {yellow('주제 전환')}  (topic_question_counter ≥ {TOPIC_QUESTION_THRESHOLD})")
     else:
         print(f"  판정                : {green('전환 없음')}")
 
@@ -448,12 +466,36 @@ def show_stack_detail(engine: HashimotoEngine) -> None:
         print(f"         명제      : {slot.proposition_statement}")
         print(f"         깊이      : {slot.expected_answer_depth}")
         print(f"         생성 depth: {slot.depth_at_creation}")
+        if slot.parent_slot_id:
+            print(f"         부모슬롯  : {dim(slot.parent_slot_id)}")
         if slot.evidence:
             print(f"         근거      : {dim(slot.evidence)}")
         if slot.verification_criteria:
             print("         기준      :")
             for c in slot.verification_criteria:
                 print(f"           • {c.criterion}  (weight={c.weight})")
+
+
+def show_archive(engine: HashimotoEngine) -> None:
+    verified = engine._verified_archive
+    refused = engine._refused_archive
+    if not verified and not refused:
+        print(f"  {dim('(아카이브 비어있음)')}")
+        return
+    if verified:
+        print(f"\n  {green(bold(f'검증 완료 [{len(verified)}]'))}")
+        for slot in verified:
+            print(f"    • {bold(slot.slot_id)}  score={score_bar(slot.fulfillment_score)}")
+            print(f"      명제: {slot.proposition_statement}")
+            if slot.parent_slot_id:
+                print(f"      부모: {dim(slot.parent_slot_id)}")
+    if refused:
+        print(f"\n  {red(bold(f'응답 거부 [{len(refused)}]'))}")
+        for slot in refused:
+            print(f"    • {bold(slot.slot_id)}")
+            print(f"      명제: {slot.proposition_statement}")
+            if slot.evidence:
+                print(f"      근거: {dim(slot.evidence)}")
 
 
 def show_full_turn(
@@ -503,6 +545,7 @@ def show_help(mode: str) -> None:
         ("stack",        "Priority Stack 전체 슬롯 상세"),
         ("slot <id>",    "특정 슬롯 전체 필드 조회"),
         ("topics",       "주제 목록 및 진행 현황"),
+        ("archive",      "검증/거부 슬롯 아카이브 조회"),
         ("llm",          "마지막 LLM 분석 원시 JSON"),
         ("sapien",       "마지막 Sapien 패키지 원시 JSON"),
         ("sysprompt",    "시스템 프롬프트 전체 출력"),
@@ -589,6 +632,10 @@ def main() -> None:
                     print(f"    {i}. {t}")
             else:
                 print(f"  대기  : {dim('(마지막 주제)')}")
+
+        elif cmd == "archive":
+            section("슬롯 아카이브")
+            show_archive(engine)
 
         elif cmd == "llm":
             if engine._last_analysis:

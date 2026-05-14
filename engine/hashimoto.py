@@ -2,8 +2,9 @@ from typing import List, Optional
 
 from llm.client import HashimotoLLMClient
 from llm.topic_extractor import extract_topics
-from engine.state import EngineState, effective_depth_threshold
+from engine.state import EngineState, effective_depth_threshold, TOPIC_QUESTION_THRESHOLD
 from models.io import EngineInput, LLMAnalysisOutput, SapienStrategyPackage
+from models.slot import Slot
 
 
 class HashimotoEngine:
@@ -24,6 +25,9 @@ class HashimotoEngine:
         self.state = EngineState(root_topic)
         self._llm = HashimotoLLMClient()
         self._topic_queue: List[str] = list(topic_queue or [])
+        # topic switch 후에도 소멸되지 않는 엔진 레벨 아카이브
+        self._verified_archive: List[Slot] = []
+        self._refused_archive: List[Slot] = []
         # 테스트·디버그용 — 마지막 턴의 중간 결과 보존
         self._last_analysis: Optional[LLMAnalysisOutput] = None
         self._last_prune_trigger: str = "none"  # "none" | "llm" | "system"
@@ -67,32 +71,52 @@ class HashimotoEngine:
             confidence=engine_input.multimodal.confidence,
         )
 
-        # 3. Stack Compaction
+        # 3. 슬롯 평가 반영 (response_type Python 교정 포함)
         self.state.apply_evaluations(analysis.slot_evaluations)
 
-        # 4. Abductive Branching + State Transition
-        emergent = analysis.abduction.emergent_slot if analysis.abduction else None
-        self.state.apply_state_commands(analysis.state_commands, emergent)
+        # 3b. ANSWERED/REFUSED 슬롯 스택 제거 → 엔진 레벨 아카이브 적재
+        verified, refused = self.state.process_slot_resolutions(analysis.slot_evaluations)
+        self._verified_archive.extend(verified)
+        self._refused_archive.extend(refused)
 
-        # 5. 주제 전환 판정 — LLM 출력과 독립적으로 depth 기반 시스템 체크
+        # 4. Abductive Branching + State Transition
+        # PUSH: INSUFFICIENT 부모 제거 + evidence 상속 + 연속 슬롯 push
+        emergent = analysis.abduction.emergent_slot if analysis.abduction else None
+        parent_slot_id = analysis.abduction.parent_slot_id if analysis.abduction else None
+        self.state.apply_state_commands(analysis.state_commands, emergent, parent_slot_id)
+
+        # 5. 두 단계 PRUNE 판정
         llm_pruned = analysis.state_commands.stack_action.upper() == "PRUNE"
-        # apply_state_commands가 LLM PRUNE을 처리했다면 depth는 이미 0 → should_prune() = False
-        system_prune = not llm_pruned and self.state.should_prune(
-            effective_depth_threshold(engine_input.multimodal.anxiety)
+        depth_threshold = effective_depth_threshold(engine_input.multimodal.anxiety)
+
+        # 5a. root topic 전환 — LLM 명시 PRUNE 또는 주제 누적 질문 수 초과
+        topic_switch_needed = llm_pruned or self.state.should_switch_topic(TOPIC_QUESTION_THRESHOLD)
+
+        # 5b. within-topic depth pruning — topic 전환 없이 낮은 depth 슬롯으로 복귀
+        # apply_state_commands가 LLM PRUNE을 처리했다면 depth는 이미 0 → should_depth_prune() = False
+        depth_prune_needed = (
+            not topic_switch_needed
+            and self.state.should_depth_prune(depth_threshold)
         )
 
-        self._last_prune_trigger = "llm" if llm_pruned else ("system" if system_prune else "none")
-
         topic_changed = False
-        if llm_pruned or system_prune:
+        transition_hint = None
+
+        if depth_prune_needed:
+            self.state.depth_prune()
+            transition_hint = "direction_change"
+            self._last_prune_trigger = "depth"
+        elif topic_switch_needed:
             if self._topic_queue:
                 next_topic = self._topic_queue.pop(0)
                 self.state = EngineState(next_topic)
                 topic_changed = True
             else:
-                # 남은 주제 없음 — 현재 상태만 초기화
                 self.state.prune()
             self._llm.reset_history()
+            self._last_prune_trigger = "llm" if llm_pruned else "topic_count"
+        else:
+            self._last_prune_trigger = "none"
 
         # 6. Package strategy for Sapien
         return SapienStrategyPackage.from_analysis(
@@ -101,6 +125,7 @@ class HashimotoEngine:
             depth_level=self.state.depth_counter,
             multimodal=engine_input.multimodal,
             topic_changed=topic_changed,
+            transition_hint=transition_hint,
         )
 
     def reset(self, new_topic: str) -> None:

@@ -32,30 +32,63 @@
 
 ---
 
-## 3. 주제 전환 트리거: 시스템 주도 PRUNE
+## 3. PRUNE의 두 단계: within-topic depth prune vs root topic 전환
 
-**결정**: 주제 전환은 LLM의 출력(`stack_action == "PRUNE"`)에 의존하지 않는다. Python 시스템이 depth 조건을 독립적으로 체크하여 LLM이 PRUNE을 누락하더라도 강제 전환한다.
+**결정**: PRUNE은 두 가지 다른 동작으로 분리된다.
 
-**구현 위치**: `engine/state.py` → `should_prune(threshold)`, `engine/hashimoto.py` / `engine/low_latency.py` step 5
+| 단계 | 트리거 | 동작 | root_topic 변경 |
+|---|---|---|---|
+| **within-topic depth prune** | 시스템: `depth_counter >= threshold` AND 스택에 더 낮은 depth 슬롯 존재 | `state.depth_prune()` — 깊은 슬롯 제거, 낮은 depth 슬롯으로 복귀 | **유지** |
+| **root topic 전환** | LLM: `stack_action == "PRUNE"` OR 시스템: `topic_question_counter >= TOPIC_QUESTION_THRESHOLD` | `EngineState` 교체 또는 `state.prune()` | **변경** |
+
+**구현 위치**: `engine/state.py` → `should_depth_prune()`, `depth_prune()`, `should_switch_topic()`, `engine/hashimoto.py` / `engine/low_latency.py` step 5
 
 **판정 로직 (변경 금지)**
 ```python
-llm_pruned   = analysis.state_commands.stack_action.upper() == "PRUNE"
-system_prune = not llm_pruned and self.state.should_prune(
-    effective_depth_threshold(engine_input.multimodal.anxiety)
+llm_pruned = analysis.state_commands.stack_action.upper() == "PRUNE"
+depth_threshold = effective_depth_threshold(engine_input.multimodal.anxiety)
+
+topic_switch_needed = llm_pruned or self.state.should_switch_topic(TOPIC_QUESTION_THRESHOLD)
+
+depth_prune_needed = (
+    not topic_switch_needed
+    and self.state.should_depth_prune(depth_threshold)
 )
-if llm_pruned or system_prune:
-    → 주제 전환 처리
+
+if depth_prune_needed:
+    → state.depth_prune(), transition_hint="direction_change"
+elif topic_switch_needed:
+    → EngineState 교체 또는 state.prune()
 ```
 
 **침범 금지 사항**
-- `system_prune` 체크를 삭제하거나 LLM 조건 뒤로 이동시키지 않는다.
-- `not llm_pruned` 가드를 유지한다. `apply_state_commands`가 LLM PRUNE을 처리하면 `depth_counter`가 0으로 리셋되므로 `should_prune()`은 자동으로 False를 반환한다. 이 순서에 의존하는 설계다.
-- `should_prune()`의 시그니처에서 `threshold` 파라미터를 제거하지 않는다.
+- `topic_switch_needed`를 `depth_prune_needed`보다 먼저 평가한다. 두 조건이 동시에 충족되면 topic 전환이 우선한다.
+- `depth_prune_needed`에 `not topic_switch_needed` 가드를 유지한다.
+- `depth_prune()`은 `topic_question_counter`를 리셋하지 않는다. 같은 root_topic 내 누적 질문 수는 보존해야 한다.
+- `should_depth_prune()`의 `threshold` 파라미터를 제거하지 않는다.
+- `should_switch_topic()`의 `threshold` 파라미터를 제거하지 않는다.
 
 ---
 
-## 4. 불안도 기반 동적 depth 임계값
+## 4. Root Topic 전환 트리거: topic_question_counter
+
+**결정**: 단일 root_topic에 대한 누적 질문 횟수(`topic_question_counter`)가 `TOPIC_QUESTION_THRESHOLD`에 도달하면 시스템이 강제로 topic 전환을 트리거한다. 이를 통해 하나의 주제에서 지나치게 긴 문답이 이어지는 것을 방지한다.
+
+**구현 위치**: `engine/state.py` → `EngineState.topic_question_counter`, `should_switch_topic(threshold)`
+
+**동작 규칙**
+- `topic_question_counter`는 `apply_state_commands()` 호출 시마다 무조건 +1 증가한다.
+- `depth_prune()` 호출 시 **리셋되지 않는다**. root_topic이 동일한 한 누적을 유지한다.
+- `EngineState`가 새 인스턴스로 교체되는 시점(root topic 전환)에만 0으로 리셋된다.
+- `TOPIC_QUESTION_THRESHOLD = 10` (기본값, `engine/state.py` 상단 상수로 중앙 관리).
+
+**침범 금지 사항**
+- `topic_question_counter` 증가를 PRUNE 여부와 무관하게 항상 수행한다. 조건 분기 안으로 넣지 않는다.
+- `TOPIC_QUESTION_THRESHOLD`를 다른 파일에서 하드코딩하지 않는다.
+
+---
+
+## 5. 불안도 기반 동적 depth 임계값
 
 **결정**: 지원자의 불안도(anxiety)가 높을수록 `depth_counter` 임계값을 낮춰 주제를 더 빨리 전환한다.
 
@@ -76,7 +109,7 @@ if llm_pruned or system_prune:
 
 ---
 
-## 5. 저지연 모드: 비동기 파이프라인
+## 6. 저지연 모드: 비동기 파이프라인
 
 **결정**: `LowLatencyHashimotoEngine`은 STT 도착 즉시 반환하고(`submit_turn`), Hashimoto 분석은 백그라운드에서 실행한다. Sapien은 `latest_strategy`를 블로킹 없이 읽어 질문을 생성한다.
 
@@ -94,7 +127,7 @@ if llm_pruned or system_prune:
 
 ---
 
-## 6. LLM 호출: 턴당 단일 호출
+## 7. LLM 호출: 턴당 단일 호출
 
 **결정**: 매 턴마다 LLM을 **1회만** 호출하며, 슬롯 평가 + 가추 + 상태 명령 + 전략 전달을 하나의 응답에서 받는다.
 
@@ -102,38 +135,101 @@ if llm_pruned or system_prune:
 
 **침범 금지 사항**
 - 슬롯 평가와 가추를 별도 LLM 호출로 분리하지 않는다.
-- 시스템 프롬프트(`SYSTEM_PROMPT`)에 동적 값(턴 번호, 슬롯 내용, 멀티모달 신호 등)을 삽입하지 않는다. 동적 값은 모두 `build_turn_message()`의 유저 메시지에만 포함한다. **시스템 프롬프트는 캐싱 대상(안정적 접두사)이므로 불변이어야 한다.**
-- 시스템 프롬프트의 `cache_control: {"type": "ephemeral"}`을 제거하지 않는다.
+- 시스템 프롬프트(`SYSTEM_PROMPT`)에 동적 값(턴 번호, 슬롯 내용, 멀티모달 신호 등)을 삽입하지 않는다. 동적 값은 모두 `build_turn_message()`의 유저 메시지에만 포함한다. **시스템 프롬프트는 불변이어야 한다.**
+- `system_instruction`은 `__init__` 시점에 `GenerateContentConfig`에 고정한다. 매 호출마다 재생성하지 않는다.
 
 ---
 
-## 7. LLM 모델 및 파라미터
+## 8. LLM 모델 및 파라미터
 
-**결정**: `claude-opus-4-7`, `thinking: {"type": "adaptive"}`, `output_config: {"effort": "high"}`를 사용한다.
+**결정**: `gemini-2.5-pro`, `thinking_budget=-1`(dynamic thinking)을 사용한다.
 
-**구현 위치**: `llm/client.py`, `llm/async_client.py` 상단 상수
+**구현 위치**: `llm/client.py`, `llm/async_client.py`, `llm/topic_extractor.py` 상단 상수
+
+```python
+_MODEL = "gemini-2.5-pro"
+
+# HashimotoLLMClient / AsyncHashimotoLLMClient
+self._config = types.GenerateContentConfig(
+    system_instruction=build_system_prompt(),
+    thinking_config=types.ThinkingConfig(thinking_budget=-1),
+)
+
+# topic_extractor는 thinking 불필요 — 별도 config 사용
+types.GenerateContentConfig(system_instruction=_SYSTEM)
+```
 
 **침범 금지 사항**
 - 모델을 비용 절감 목적으로 변경하지 않는다. 모델 변경은 명시적 요구사항이 있을 때만 한다.
-- `thinking`을 `{"type": "enabled", budget_tokens: N}` 형태로 교체하지 않는다. Opus 4.7에서 지원되지 않는다.
-- `effort` 값을 `"low"`나 `"medium"`으로 낮추지 않는다. 가추 추론의 품질이 effort에 민감하다.
+- `thinking_budget`을 `0`으로 설정하지 않는다. thinking을 비활성화하면 가추 추론 품질이 저하된다.
+- `thinking_budget=-1`(dynamic)을 고정 토큰 수로 교체하지 않는다. 동적 할당이 복잡도에 따라 비용과 품질을 자동 조정한다.
+- 환경 변수 키는 `GEMINI_API_KEY`를 사용한다. `ANTHROPIC_API_KEY`로 되돌리지 않는다.
 
 ---
 
-## 8. 출력 스키마: SapienStrategyPackage
+## 9. 출력 스키마: SapienStrategyPackage
 
-**결정**: `interaction_strategy.current_context`에는 반드시 `topic`, `depth_level`, `topic_changed`, `multimodal_feedback_requirement` 네 필드가 포함된다.
+**결정**: `interaction_strategy.current_context`에는 반드시 `topic`, `depth_level`, `topic_changed`, `transition_hint`, `multimodal_feedback_requirement` 다섯 필드가 포함된다.
 
 **구현 위치**: `models/io.py` → `SapienStrategyPackage.from_analysis()`
 
 **침범 금지 사항**
-- `topic_changed` 필드를 제거하거나 다른 위치로 이동하지 않는다. Sapien이 전환 감지에 사용한다.
+- `topic_changed` 필드를 제거하거나 다른 위치로 이동하지 않는다. Sapien이 root topic 전환 감지에 사용한다.
+- `transition_hint` 필드를 제거하지 않는다. `"direction_change"` 값은 Sapien이 "잘 알겠습니다" / "자, 그러면" 등의 추임새를 삽입하는 신호다. `None`이면 추임새 없음.
 - `multimodal_feedback_requirement`의 자동 생성 로직(anxiety > 70, confidence < 30)을 삭제하지 않는다.
 - `from_analysis()`의 `topic_changed` 파라미터 기본값은 `False`를 유지한다.
+- `from_analysis()`의 `transition_hint` 파라미터 기본값은 `None`을 유지한다.
 
 ---
 
-## 9. LLM 호출 무상태성(Stateless): Slot Map이 대화 메모리
+## 10. 슬롯 해소: 3경로 모두 현재 슬롯을 스택에서 제거
+
+**결정**: 모든 응답 유형은 반드시 현재 슬롯을 스택에서 제거하는 경로로 귀결된다. 슬롯의 스택 잔류가 무한히 이어지지 않도록 각 경로는 명확히 정의된다.
+
+**구현 위치**: `engine/state.py` → `apply_evaluations()`, `process_slot_resolutions()`, `apply_state_commands()`; `engine/hashimoto.py` / `engine/low_latency.py` → `_verified_archive`, `_refused_archive`
+
+**3경로 정의**
+
+| response_type | 조건 | Python 동작 | 아카이브 |
+|---|---|---|---|
+| `ANSWERED` | score ≥ 0.7 | 스택 제거 | `_verified_archive` |
+| `REFUSED` | 거부·모름 | 스택 제거 | `_refused_archive` |
+| `INSUFFICIENT` | score < 0.7, 답변 시도 있음 | PUSH 시 부모 스택 제거 + 연속 슬롯 생성 | 없음 |
+
+**Python 교정 (변경 금지)**
+LLM이 `ANSWERED`로 분류했더라도 `fulfillment_score < FULFILLMENT_THRESHOLD`이면 Python이 `INSUFFICIENT`로 교정한다. `apply_evaluations()` 내에서 수행되며 LLM 분류보다 Python 교정이 우선한다.
+
+**호출 순서 (변경 금지)**
+```
+apply_evaluations()          ← response_type 기록 + Python 교정
+    ↓
+process_slot_resolutions()   ← ANSWERED/REFUSED 스택 제거 + 아카이브 반환
+    ↓
+apply_state_commands()       ← INSUFFICIENT 부모 스택 제거 + 연속 슬롯 PUSH
+```
+
+`process_slot_resolutions()`를 `apply_state_commands()` 이전에 호출한다. INSUFFICIENT 부모는 PUSH 시점까지 스택에 잔류해야 하므로 `process_slot_resolutions()`에서는 제거하지 않는다.
+
+**아카이브 범위 (변경 금지)**
+- `_verified_archive`, `_refused_archive`는 `EngineState`가 아닌 엔진(`HashimotoEngine` / `LowLatencyHashimotoEngine`) 인스턴스에 위치한다.
+- topic switch 후에도 아카이브는 소멸하지 않고 누적된다. 이전 주제에서 동일한 슬롯이 재생성되는 것을 방지하기 위한 참조로 활용된다.
+- PRUNE으로 강제 제거된 슬롯(아직 평가되지 않은 PENDING 슬롯)은 어느 아카이브에도 포함되지 않고 소멸한다.
+
+**연속 슬롯 evidence 상속 (변경 금지)**
+`apply_state_commands()`의 PUSH 처리 시 부모 슬롯의 `proposition_statement`와 `evidence`를 연속 슬롯의 초기 `evidence`에 주입한다. 형식:
+```
+[부모 명제] {parent.proposition_statement} | [기존 응답 근거] {parent.evidence}
+```
+연속 슬롯의 `parent_slot_id`는 부모 슬롯 ID로 설정한다. 부모 슬롯 객체는 `global_slot_map`에 보존(계보 참조용)되고 `priority_stack`에서만 제거된다.
+
+**침범 금지 사항**
+- `process_slot_resolutions()`에서 INSUFFICIENT 슬롯을 제거하지 않는다. PUSH 흐름에서 처리한다.
+- 아카이브를 `EngineState` 안으로 이동하지 않는다. topic switch 시 `EngineState`가 교체되므로 아카이브 데이터가 소멸된다.
+- PUSH 시 `parent_slot_id`를 `apply_state_commands()`에 전달한다. LLM이 명시한 `parent_slot_id` 우선, 없으면 스택 최상단을 부모로 사용한다.
+
+---
+
+## 11. LLM 호출 무상태성(Stateless): Slot Map이 대화 메모리
 
 **결정**: LLM 클라이언트는 대화 히스토리(`_history`)를 누적하지 않는다. 매 턴 단일 user 메시지만 전송하며, 크로스-턴 맥락은 `active_slots_context`(슬롯의 충족도·증거·상태)가 전담한다.
 
@@ -151,12 +247,17 @@ turn N:   analyze_turn() → LLM이 evidence="A를 언급, B는 미서술"을 �
 
 turn N+1: to_context_str()가 Evidence So Far: A를 언급, B는 미서술 포함
            → 새 LLM이 직전 턴의 판단 결과를 인식한 채로 분석
+
+[연속 슬롯의 경우]
+turn N+1: to_context_str()가 Derived From + Evidence(부모 명제 + 기존 근거) 포함
+           → LLM이 부모 슬롯에서 무엇이 불충분했는지 파악한 채로 분석
 ```
 
 **침범 금지 사항**
 - `HashimotoLLMClient` / `AsyncHashimotoLLMClient`에 `_history` 리스트를 재추가하지 않는다.
 - `messages` 파라미터에 이전 턴의 user/assistant 쌍을 포함시키지 않는다. `[{"role": "user", "content": user_message}]` 형태를 유지한다.
 - `Slot.to_context_str()`에서 `evidence` 필드 출력을 제거하지 않는다. 이것이 히스토리 없이 크로스-턴 맥락을 전달하는 유일한 수단이다.
+- 연속 슬롯 생성 시 부모 evidence 주입을 생략하지 않는다. 주입하지 않으면 LLM이 동일한 질문을 재생성할 수 있다.
 - `reset_history()`는 API 호환성을 위해 유지하되 no-op으로 남긴다. PRUNE 후 engine이 이를 호출하는 것은 설계 의도다(Section 2 참조).
 - `fulfillment_score` 임계값은 프롬프트(`SYSTEM_PROMPT`)와 코드(`FULFILLMENT_THRESHOLD = 0.7`) 양쪽에서 반드시 동일한 값을 사용한다. 어느 한쪽만 변경하지 않는다.
 
@@ -166,13 +267,30 @@ turn N+1: to_context_str()가 Evidence So Far: A를 언급, B는 미서술 포�
 
 새 기능을 추가하거나 기존 코드를 수정할 때 아래를 확인한다.
 
+**LLM 호출 불변 조건**
 - [ ] `submit_turn()` / `process_turn()`이 여전히 단일 LLM 호출만 수행하는가?
 - [ ] 시스템 프롬프트에 동적 값이 삽입되지 않았는가?
-- [ ] 주제 전환이 `llm_pruned OR system_prune` 조건으로 처리되는가?
+- [ ] `messages` 파라미터가 단일 user 메시지만 포함하는가? (히스토리 누적 금지)
+- [ ] `SYSTEM_PROMPT`의 fulfillment 임계값과 `FULFILLMENT_THRESHOLD` 상수가 일치하는가?
+- [ ] `system_instruction`이 `__init__` 시점의 `GenerateContentConfig`에 고정되어 있는가?
+- [ ] `thinking_budget=-1`이 유지되는가? (`0`으로 설정되어 thinking이 비활성화되지 않았는가?)
+
+**슬롯 해소 흐름**
+- [ ] `apply_evaluations()` → `process_slot_resolutions()` → `apply_state_commands()` 순서가 유지되는가?
+- [ ] `apply_evaluations()`에서 ANSWERED + score < threshold를 INSUFFICIENT로 교정하는가?
+- [ ] ANSWERED/REFUSED 슬롯이 엔진 레벨(`_verified_archive` / `_refused_archive`)에 적재되는가?
+- [ ] PUSH 시 부모 슬롯이 스택에서 제거되고 evidence가 연속 슬롯에 상속되는가?
+- [ ] `parent_slot_id`가 `apply_state_commands()`에 전달되는가?
+- [ ] `Slot.to_context_str()`이 `evidence`와 `parent_slot_id`(있을 경우) 필드를 포함하여 반환하는가?
+
+**PRUNE / 주제 전환**
+- [ ] `topic_switch_needed`가 `depth_prune_needed`보다 먼저 평가되는가?
+- [ ] `depth_prune_needed`에 `not topic_switch_needed` 가드가 있는가?
 - [ ] `effective_depth_threshold(anxiety)`를 경유하여 임계값을 계산하는가?
-- [ ] `topic_changed` 플래그가 `SapienStrategyPackage`에 포함되어 반환되는가?
+- [ ] `topic_question_counter` 증가가 PRUNE 여부와 무관하게 항상 수행되는가?
+- [ ] `depth_prune()` 호출 시 `topic_question_counter`가 리셋되지 않는가?
+- [ ] `topic_changed`와 `transition_hint` 플래그가 `SapienStrategyPackage`에 포함되어 반환되는가?
+
+**아키텍처**
 - [ ] `LowLatencyHashimotoEngine`의 워커가 단일 태스크인가?
 - [ ] `from_resume()`이 턴 루프 외부에서만 호출되는가?
-- [ ] `messages` 파라미터가 단일 user 메시지만 포함하는가? (히스토리 누적 금지)
-- [ ] `Slot.to_context_str()`이 `evidence` 필드를 포함하여 반환하는가?
-- [ ] `SYSTEM_PROMPT`의 fulfillment 임계값과 `FULFILLMENT_THRESHOLD` 상수가 일치하는가?

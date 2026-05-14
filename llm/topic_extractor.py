@@ -1,17 +1,19 @@
 import json
 import os
 import re
+import time
 from typing import List
 
-import anthropic
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
 
-_MODEL = "claude-opus-4-7"
-_MAX_TOKENS = 1024
+_MODEL = "gemini-2.5-flash-lite"
 
-_SYSTEM = """\
+_SYSTEM = """
 당신은 채용 면접 설계 전문가입니다.
 지원자의 자기소개서를 분석하여 면접에서 심층적으로 검증할 주제를 추출합니다.
 반드시 JSON 배열만 출력하세요. 코드블록이나 설명 텍스트는 절대 포함하지 마세요.
@@ -20,7 +22,7 @@ _SYSTEM = """\
 
 def extract_topics(resume_text: str, count: int) -> List[str]:
     """자기소개서에서 면접 root_topic을 count개 추출한다."""
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     prompt = f"""\
 아래 자기소개서를 읽고, 면접에서 심층적으로 검증할 수 있는 핵심 주제를 정확히 {count}개 추출하세요.
@@ -38,14 +40,20 @@ def extract_topics(resume_text: str, count: int) -> List[str]:
 {resume_text}
 """
 
-    response = client.messages.create(
-        model=_MODEL,
-        max_tokens=_MAX_TOKENS,
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    for attempt in range(6):
+        try:
+            response = client.models.generate_content(
+                model=_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(system_instruction=_SYSTEM),
+            )
+            break
+        except genai_errors.ServerError:
+            if attempt == 5:
+                raise
+            time.sleep(2 ** attempt)
 
-    raw = response.content[0].text
+    raw = response.text
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.DOTALL)
     topics: List[str] = json.loads(cleaned)
 

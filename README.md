@@ -8,13 +8,16 @@
 
 | 개념 | 설명 |
 |---|---|
-| **Slot** | 아직 검증되지 않은 명제 또는 질문 단위. 지원자 답변으로 충족되면 제거됨 |
+| **Slot** | 아직 검증되지 않은 명제 또는 질문 단위. 모든 응답 경로(충족·불충분·거부)에서 스택에서 제거됨 |
 | **Priority_Stack** | 활성 슬롯의 LIFO 스택. 인덱스 0이 최상단(가장 최신 슬롯) |
 | **Depth_Counter** | 현재 주제 내 연속 질문 횟수. 임계값(5) 도달 시 Pruning 발동 |
-| **Abduction(가추법)** | 지원자 답변의 논리적 공백으로부터 원인을 역추론하여 새 슬롯 생성 |
+| **Topic_Question_Counter** | 현재 root_topic에 대한 누적 질문 수. 임계값(10) 도달 시 강제 topic 전환 |
+| **Abduction(가추법)** | 지원자 답변의 논리적 공백으로부터 원인을 역추론하여 연속 슬롯 생성 |
 | **Multi-Slot Scanning** | 스택 상위 N개(기본 3개) 슬롯을 동시에 평가 |
-| **Fulfillment Score** | 슬롯 충족도 (0.0–1.0). 0.7 이상이면 VERIFIED → 스택에서 제거 |
-| **Pruning** | Depth_Counter가 임계값에 도달하면 스택을 초기화하고 다음 주제로 전환 |
+| **Fulfillment Score** | 슬롯 충족도 (0.0–1.0). 0.7 이상이면 VERIFIED(충족됨 아카이브 이동) |
+| **response_type** | LLM이 분류한 응답 유형: `ANSWERED`(답변 시도) / `INSUFFICIENT`(핵심 미충족) / `REFUSED`(거부·모름) |
+| **Pruning** | Depth_Counter가 임계값에 도달하면 스택을 초기화하고 다음 주제로 전환. within-topic prune과 root topic 전환 두 단계로 분리 |
+| **Archive** | 해소된 슬롯의 영구 저장소. `verified_archive`(충족됨) / `refused_archive`(거부됨). topic 전환 후에도 소멸하지 않음 |
 
 ---
 
@@ -78,25 +81,37 @@ HashimotoEngine(
         │
         ▼
 1. 활성 슬롯 컨텍스트 구성 (스택 상위 3개)
-   └─ 각 슬롯: proposition, score, criteria, evidence(직전 턴 판단 결과)
+   └─ 각 슬롯: proposition, score, criteria, evidence
+      연속 슬롯이면 Derived From + 부모 evidence 포함
         │
         ▼
 2. LLM 단일 호출 — 히스토리 없음, 슬롯 컨텍스트가 크로스-턴 메모리
    (claude-opus-4-7 + Adaptive Thinking)
-   ├─ slot_evaluations  : 각 슬롯의 충족도 평가 + evidence 갱신
-   ├─ abduction         : 논리 공백 역추론 → 새 슬롯 후보
-   ├─ state_commands    : PUSH / POP / NONE / PRUNE
+   ├─ slot_evaluations  : 슬롯 평가 + response_type(ANSWERED/INSUFFICIENT/REFUSED)
+   ├─ abduction         : 논리 공백 역추론 → 연속 슬롯 후보 + parent_slot_id
+   ├─ state_commands    : PUSH / NONE / PRUNE
    └─ strategy          : Sapien에 전달할 질문 전략
         │
         ▼
-3. 평가 반영 → Slot.evidence / Slot.fulfillment_score 갱신
-   score ≥ 0.7이면 VERIFIED 마킹
+3. 평가 반영 → Slot.evidence / fulfillment_score / response_type 갱신
+   Python 교정: ANSWERED + score < 0.7 → INSUFFICIENT로 재분류
         │
         ▼
-4. 스택 조작 + 주제 전환 (PRUNE 시 다음 주제로 자동 이동)
+3b. 슬롯 해소 라우팅 (process_slot_resolutions)
+   ├─ ANSWERED (score ≥ 0.7) → 스택 제거 → verified_archive
+   └─ REFUSED              → 스택 제거 → refused_archive
+   ※ INSUFFICIENT는 다음 단계에서 처리
         │
         ▼
-5. SapienStrategyPackage 생성 및 반환
+4. Abductive Branching + State Transition
+   PUSH: INSUFFICIENT 부모 스택 제거 + 부모 evidence 상속 → 연속 슬롯 push
+   PRUNE: 스택 초기화 + 다음 주제로 이동
+        │
+        ▼
+5. within-topic depth prune / root topic 전환 판정
+        │
+        ▼
+6. SapienStrategyPackage 생성 및 반환
 ```
 
 ### 저지연 모드 (비동기 병렬)
@@ -158,11 +173,13 @@ class Slot(BaseModel):
     expected_answer_depth: str     # Surface | Conceptual | Technical_Deep_Dive | Experiential
     status: SlotStatus             # PENDING | VERIFIED
     fulfillment_score: float       # 0.0–1.0
-    evidence: Optional[str]        # LLM이 찾은 근거 또는 부재 이유 ← 크로스-턴 메모리
+    evidence: Optional[str]        # LLM이 찾은 근거, 연속 슬롯이면 부모 근거 포함 ← 크로스-턴 메모리
     depth_at_creation: int         # 생성 시점의 Depth_Counter
+    parent_slot_id: Optional[str]  # INSUFFICIENT로 제거된 부모 슬롯 ID (연속 슬롯에만 설정)
+    resolution_type: Optional[str] # 아카이브 기록용: "VERIFIED" | "REFUSED"
 ```
 
-`evidence`는 단순 메타데이터가 아닙니다. LLM 클라이언트가 대화 히스토리를 유지하지 않기 때문에, `to_context_str()`이 이 필드를 다음 턴의 프롬프트에 포함시켜 "직전 턴에서 무엇이 확인됐는가"를 LLM에 전달합니다. Slot Map이 Hashimoto의 유일한 크로스-턴 메모리입니다.
+`evidence`는 단순 메타데이터가 아닙니다. LLM 클라이언트가 대화 히스토리를 유지하지 않기 때문에, `to_context_str()`이 이 필드를 다음 턴의 프롬프트에 포함시켜 "직전 턴에서 무엇이 확인됐는가"를 LLM에 전달합니다. 연속 슬롯의 경우 부모 슬롯의 `proposition`과 `evidence`가 초기값으로 주입되어 LLM이 부모에서 무엇이 불충분했는지 파악할 수 있습니다. Slot Map이 Hashimoto의 유일한 크로스-턴 메모리입니다.
 
 #### `models/io.py`
 
@@ -178,12 +195,15 @@ class Slot(BaseModel):
 
 - `global_slot_map`: `slot_id → Slot` 딕셔너리
 - `priority_stack`: LIFO 슬롯 ID 목록 (인덱스 0 = 최상단)
-- `depth_counter`: 현재 주제 연속 질문 횟수
+- `depth_counter`: 현재 주제 연속 질문 횟수 (branch depth)
+- `topic_question_counter`: 현재 root_topic 내 누적 질문 수
 
 ```python
-FULFILLMENT_THRESHOLD = 0.7   # 이 이상이면 VERIFIED
-ACTIVE_WINDOW = 3              # Multi-Slot Scanning 윈도우 크기
-PRUNE_DEPTH_THRESHOLD = 5      # Pruning 발동 깊이
+FULFILLMENT_THRESHOLD = 0.7      # 이 이상이면 VERIFIED
+ACTIVE_WINDOW = 3                 # Multi-Slot Scanning 윈도우 크기
+PRUNE_DEPTH_THRESHOLD = 5         # within-topic depth prune 발동 깊이
+MIN_PRUNE_DEPTH_THRESHOLD = 2     # 불안도 최고 시 최소 임계값
+TOPIC_QUESTION_THRESHOLD = 10     # root topic 강제 전환 누적 질문 수
 ```
 
 #### `engine/hashimoto.py`
@@ -228,10 +248,10 @@ engine = LowLatencyHashimotoEngine.from_resume(
 
 #### `llm/client.py` / `llm/async_client.py`
 
-- `claude-opus-4-7`, `thinking: {"type": "adaptive"}`, `output_config: {"effort": "high"}` 사용
-- 시스템 프롬프트에 `cache_control: {"type": "ephemeral"}` 적용 → 반복 호출 시 캐시 히트로 비용 절감
-- **Stateless 설계**: 대화 히스토리를 누적하지 않습니다. 매 턴마다 `messages=[{"role": "user", "content": ...}]` 단일 메시지만 전송합니다. 멀티턴 맥락은 `active_slots_context`(슬롯 충족도·증거)가 대신하며, 일반적인 대화 맥락 보존은 Sapien의 역할입니다.
-- `async_client.py`는 `AsyncAnthropic`을 사용하며, `await` 기반으로 동작
+- `gemini-2.5-pro`, `thinking_budget=-1`(dynamic thinking) 사용
+- 시스템 프롬프트는 `__init__` 시점에 `GenerateContentConfig`에 고정 (`system_instruction`)
+- **Stateless 설계**: 대화 히스토리를 누적하지 않습니다. 매 턴마다 단일 `contents` 메시지만 전송합니다. 멀티턴 맥락은 `active_slots_context`(슬롯 충족도·증거)가 대신하며, 일반적인 대화 맥락 보존은 Sapien의 역할입니다.
+- `async_client.py`는 `client.aio.models.generate_content()`를 사용하며, `await` 기반으로 동작
 
 #### `llm/prompts.py`
 
@@ -242,7 +262,7 @@ engine = LowLatencyHashimotoEngine.from_resume(
 
 ## LLM 출력 스키마
 
-LLM은 매 턴 아래 JSON을 반환합니다.
+LLM은 매 턴 아래 JSON을 반환합니다. 슬롯의 스택 관리·아카이브 처리는 Python 시스템이 담당하며, LLM은 평가와 명제 생성만 수행합니다.
 
 ```json
 {
@@ -250,12 +270,14 @@ LLM은 매 턴 아래 JSON을 반환합니다.
     {
       "slot_id": "string",
       "fulfillment_score": 0.0,
-      "evidence": "근거 또는 부재 이유"
+      "evidence": "근거 또는 부재 이유",
+      "response_type": "ANSWERED | INSUFFICIENT | REFUSED"
     }
   ],
   "abduction": {
     "observed_gap": "이번 답변에서 발견된 논리적 공백",
     "abductive_hypothesis": "공백 원인에 대한 가추적 가설",
+    "parent_slot_id": "이 연속 슬롯이 보완하는 부모 슬롯의 ID",
     "emergent_slot": {
       "slot_id": "new_slot_id",
       "proposition_statement": "검증할 명제",
@@ -264,10 +286,9 @@ LLM은 매 턴 아래 JSON을 반환합니다.
     }
   },
   "state_commands": {
-    "stack_action": "PUSH | POP | NONE | PRUNE",
-    "pop_count": 0,
+    "stack_action": "PUSH | NONE | PRUNE",
     "depth_increment": 1,
-    "slots_to_pop": ["verified_slot_id"]
+    "slots_to_pop": []
   },
   "strategy": {
     "logic_goal": "이번 질문의 논리적 목표",
@@ -279,7 +300,13 @@ LLM은 매 턴 아래 JSON을 반환합니다.
 }
 ```
 
-> `abduction`이 불필요한 경우 (슬롯만 pop하면 충분할 때) `null`로 설정됩니다.
+| `response_type` 값 | 의미 | Python 동작 |
+|---|---|---|
+| `ANSWERED` | 답변 시도 있음 (score로 충족도 판단) | score ≥ 0.7이면 `verified_archive` 이동 |
+| `INSUFFICIENT` | 시도했으나 핵심 미충족 + `abduction` 필수 | 부모 제거 + 연속 슬롯 PUSH |
+| `REFUSED` | "모르겠다" / 답변 의사 없음 | `refused_archive` 이동 |
+
+> `abduction`은 `response_type == "INSUFFICIENT"`일 때만 제공됩니다. 그 외에는 `null`로 설정됩니다.
 
 ---
 
@@ -296,7 +323,7 @@ pip install -r requirements.txt
 프로젝트 루트에 `.env` 파일을 생성합니다.
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
+GEMINI_API_KEY=AIza...
 ```
 
 ### 3. CLI 데모 실행
@@ -369,6 +396,7 @@ asyncio.run(run())
     "topic": "React 상태관리 아키텍처 경험",
     "depth_level": 2,
     "topic_changed": false,
+    "transition_hint": null,
     "multimodal_feedback_requirement": null
   }
 }
@@ -376,5 +404,17 @@ asyncio.run(run())
 
 | 필드 | 설명 |
 |---|---|
-| `topic_changed` | `true`이면 이번 턴에 주제 전환이 발생. Sapien이 전환 멘트를 생성할 수 있음 |
+| `topic_changed` | `true`이면 root topic 전환 발생. Sapien이 주제 전환 멘트를 생성할 수 있음 |
+| `transition_hint` | `"direction_change"`이면 within-topic depth prune 발생. Sapien이 "잘 알겠습니다" / "자, 그러면" 등 추임새 삽입 권장. `null`이면 일반 진행 |
 | `multimodal_feedback_requirement` | 불안도 > 70 또는 자신감 < 30일 때 자동으로 채워져 Sapien의 어조 조정을 유도 |
+
+### 아카이브 접근
+
+면접 종료 후 엔진 인스턴스에서 직접 아카이브를 읽을 수 있습니다.
+
+```python
+engine.verified_archive   # 충족 응답으로 해소된 슬롯 목록 (전 주제 포함 누적)
+engine.refused_archive    # 거부·모름으로 해소된 슬롯 목록 (전 주제 포함 누적)
+```
+
+> 아카이브는 topic 전환 후에도 소멸하지 않습니다. 이전 주제에서 동일한 슬롯이 재생성되어 중복 질문이 발생하는 것을 방지하는 참조 목적으로 활용할 수 있습니다.

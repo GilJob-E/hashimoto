@@ -1,8 +1,11 @@
+import asyncio
 import json
 import os
 import re
 
-import anthropic
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from dotenv import load_dotenv
 
 from llm.prompts import build_system_prompt, build_turn_message
@@ -10,18 +13,22 @@ from models.io import LLMAnalysisOutput
 
 load_dotenv()
 
-_MODEL = "claude-opus-4-7"
-_MAX_TOKENS = 8192
+_MODEL = "gemini-2.5-flash"
 
 
 class AsyncHashimotoLLMClient:
-    """비동기 Anthropic API 래퍼. asyncio 이벤트 루프 내에서 사용.
+    """Gemini API 비동기 래퍼. asyncio 이벤트 루프 내에서 사용.
 
     Stateless per-turn: 대화 히스토리 없이 매 턴 단일 메시지만 전송.
+    시스템 프롬프트는 상수이므로 __init__ 시점에 config에 고정한다.
     """
 
     def __init__(self) -> None:
-        self._client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self._client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        self._config = types.GenerateContentConfig(
+            system_instruction=build_system_prompt(),
+            thinking_config=types.ThinkingConfig(thinking_budget=-1),
+        )
 
     async def analyze_turn(
         self,
@@ -39,34 +46,26 @@ class AsyncHashimotoLLMClient:
             confidence=confidence,
         )
 
-        response = await self._client.messages.create(
-            model=_MODEL,
-            max_tokens=_MAX_TOKENS,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
-            system=[
-                {
-                    "type": "text",
-                    "text": build_system_prompt(),
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_message}],
-        )
+        for attempt in range(6):
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=_MODEL,
+                    contents=user_message,
+                    config=self._config,
+                )
+                break
+            except genai_errors.ServerError:
+                if attempt == 5:
+                    raise
+                await asyncio.sleep(2 ** attempt)
 
-        return _parse_output(_extract_text(response))
+        return _parse_output(response.text)
 
     def reset_history(self) -> None:
         pass
 
 
-def _extract_text(response: anthropic.types.Message) -> str:
-    for block in response.content:
-        if block.type == "text":
-            return block.text
-    raise ValueError("LLM response contained no text block")
-
-
 def _parse_output(raw: str) -> LLMAnalysisOutput:
+    # Strip markdown code fences the model occasionally emits despite instructions
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.DOTALL)
     return LLMAnalysisOutput.model_validate(json.loads(cleaned))

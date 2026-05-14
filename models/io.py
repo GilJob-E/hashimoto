@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 
 class MultimodalVector(BaseModel):
@@ -19,6 +19,8 @@ class SlotEvaluationResult(BaseModel):
     slot_id: str
     fulfillment_score: float = Field(ge=0.0, le=1.0)
     evidence: str
+    # ANSWERED: 답변 시도 있음 / INSUFFICIENT: 시도했으나 핵심 미충족 / REFUSED: 거부·모름
+    response_type: Literal["ANSWERED", "INSUFFICIENT", "REFUSED"] = "ANSWERED"
 
 
 class EmergentSlotData(BaseModel):
@@ -31,6 +33,7 @@ class EmergentSlotData(BaseModel):
 class AbductionResult(BaseModel):
     observed_gap: str
     abductive_hypothesis: str
+    parent_slot_id: str  # 이 emergent_slot이 보완하는 부모 슬롯의 ID
     emergent_slot: EmergentSlotData
 
 
@@ -70,6 +73,7 @@ class SapienStrategyPackage(BaseModel):
         depth_level: int,
         multimodal: MultimodalVector,
         topic_changed: bool = False,
+        transition_hint: Optional[str] = None,
     ) -> "SapienStrategyPackage":
         adjust_note = ""
         if multimodal.anxiety > 70:
@@ -90,6 +94,7 @@ class SapienStrategyPackage(BaseModel):
                     "topic": topic,
                     "depth_level": depth_level,
                     "topic_changed": topic_changed,
+                    "transition_hint": transition_hint,
                     "multimodal_feedback_requirement": adjust_note or None,
                 },
             }
