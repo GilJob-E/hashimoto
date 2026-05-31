@@ -1,15 +1,15 @@
 """
 Hashimoto Engine 대화형 테스트 콘솔.
 
-두 가지 모드:
-  1. 실제 LLM 모드  — Gemini API를 직접 호출 (크레딧 필요)
-  2. 수동 입력 모드 — LLM에 보낼 프롬프트를 출력하고, 사용자가 JSON 응답을 직접 입력
+모든 턴은 실제 Gemini API를 호출하여 STT → Hashimoto 분석 → State 업데이트 →
+질문LLM 프롬프트 주입 → 다음 질문 생성까지 end-to-end로 실행된다. (크레딧 필요)
 """
 
 import json
-import re
 import sys
+import time
 import traceback
+from dataclasses import dataclass
 from typing import List, Optional
 
 from engine.hashimoto import HashimotoEngine
@@ -19,10 +19,9 @@ from engine.state import (
     TOPIC_QUESTION_THRESHOLD,
     effective_depth_threshold,
 )
-from llm.prompts import build_system_prompt, build_turn_message
+from llm.prompts import build_system_prompt
 from models.io import (
     EngineInput,
-    LLMAnalysisOutput,
     MultimodalVector,
     SapienStrategyPackage,
 )
@@ -93,212 +92,250 @@ def _read_multiline(prompt: str) -> str:
             lines.append(line)
     return "\n".join(lines).strip()
 
-def _read_until_end(prompt: str) -> str:
-    """'---' 단독 입력으로 종료 (JSON 입력용 — 빈 줄이 JSON 안에 있어도 무방)."""
-    print(prompt)
-    lines = []
-    while True:
-        line = input()
-        if line.strip() == "---":
-            break
-        lines.append(line)
-    return "\n".join(lines).strip()
-
 
 # ═══════════════════════════════════════════════════════════════
-# 수동 입력 모드 — Mock LLM Client
+# Latency 측정 — 파이프라인 단계별
 # ═══════════════════════════════════════════════════════════════
 
-_SCHEMA_HINT = """\
-  ┌ 출력 스키마 참고 ──────────────────────────────────────────────
-  │ {
-  │   "slot_evaluations": [
-  │     {
-  │       "slot_id": "<현재 슬롯 ID>",
-  │       "fulfillment_score": 0.0~1.0,
-  │       "evidence": "근거",
-  │       "response_type": "ANSWERED|INSUFFICIENT|REFUSED"
-  │     }
-  │   ],
-  │   "abduction": {               ← 필요 없으면 null
-  │     "observed_gap": "...",
-  │     "abductive_hypothesis": "...",
-  │     "parent_slot_id": "<부모 슬롯 ID>",
-  │     "emergent_slot": {
-  │       "slot_id": "snake_case_id",
-  │       "proposition_statement": "검증할 명제",
-  │       "verification_criteria": [{"criterion": "기준", "weight": 0.5}],
-  │       "expected_answer_depth": "Surface|Conceptual|Technical_Deep_Dive|Experiential"
-  │     }
-  │   },
-  │   "state_commands": {
-  │     "stack_action": "PUSH|NONE|PRUNE",
-  │     "depth_increment": 1,
-  │     "slots_to_pop": ["<검증된 슬롯 ID>"]
-  │   },
-  │   "strategy": {
-  │     "logic_goal": "...",
-  │     "logical_gap_to_bridge": "...",
-  │     "interviewer_intent": "...",
-  │     "focus_point": "...",
-  │     "suggested_tone": "Analytical_Pressure|Neutral_Curious|Supportive|Skeptical_Professional"
-  │   }
-  │ }
-  └───────────────────────────────────────────────────────────────"""
+@dataclass
+class TurnLatency:
+    turn: int
+    context_build_ms: float    # ① active_slots 컨텍스트 문자열 빌드
+    hashimoto_llm_ms: float    # ② analyze_turn 전체 (명제 생성·분석 LLM 포함)
+    state_update_ms: float     # ③ apply_evaluations + apply_state_commands + PRUNE + packaging
+    question_prompt_ms: float  # ④ 질문LLM 프롬프트 빌드
+    question_llm_ms: float     # ⑤ 질문LLM 호출
+
+    @property
+    def stt_to_question_prompt_ms(self) -> float:
+        """STT 수신 → 질문LLM 프롬프트 완성까지 (핵심 파이프라인 지연)."""
+        return (
+            self.context_build_ms
+            + self.hashimoto_llm_ms
+            + self.state_update_ms
+            + self.question_prompt_ms
+        )
+
+    @property
+    def total_ms(self) -> float:
+        return self.stt_to_question_prompt_ms + self.question_llm_ms
 
 
-
-class MockHashimotoLLMClient:
-    """
-    실제 API 대신 사람이 LLM 역할을 하는 클라이언트.
-    매 턴마다 LLM에 전달될 프롬프트(시스템 + 현재 슬롯 상태 + 현재 메시지)를
-    복사하기 편한 형식으로 출력하고, 사용자가 입력한 JSON을 파싱해 반환한다.
-
-    실제 클라이언트와 동일하게 stateless — 히스토리 없음.
-    대화 맥락은 active_slots_context(슬롯 충족도·증거)가 담당한다.
-    """
-
-    _BLOCK = "━" * W
+class LatencyTracker:
+    """파이프라인 직렬화 latency를 턴별로 기록하고 통계를 제공."""
 
     def __init__(self) -> None:
-        self._turn: int = 0
+        self._records: List[TurnLatency] = []
 
-    def analyze_turn(
-        self,
-        stt_text: str,
-        active_slots_context: str,
-        depth_counter: int,
-        anxiety: float,
-        confidence: float,
-    ) -> LLMAnalysisOutput:
-        user_msg = build_turn_message(
-            stt_text=stt_text,
-            active_slots_context=active_slots_context,
-            depth_counter=depth_counter,
-            anxiety=anxiety,
-            confidence=confidence,
+    def record(self, r: TurnLatency) -> None:
+        self._records.append(r)
+
+    def last(self) -> Optional[TurnLatency]:
+        return self._records[-1] if self._records else None
+
+    @property
+    def count(self) -> int:
+        return len(self._records)
+
+    def _stats(self, values: List[float]) -> dict:
+        n = len(values)
+        if n == 0:
+            return {}
+        sv = sorted(values)
+        return {
+            "min": sv[0],
+            "avg": sum(values) / n,
+            "p50": sv[n // 2],
+            "p95": sv[min(int(0.95 * n), n - 1)],
+            "max": sv[-1],
+        }
+
+    def show_table(self) -> None:
+        if not self._records:
+            print(f"  {dim('(측정된 턴 없음)')}")
+            return
+
+        hdr = (
+            f"  {'Turn':>4}  {'Total':>7}  {'①CTX':>6}"
+            f"  {'②H-LLM':>8}  {'③State':>7}"
+            f"  {'④Q-Prm':>7}  {'⑤Q-LLM':>8}  {'STT→Prm':>9}"
         )
-        self._turn += 1
+        print(f"\n{hdr}")
+        sep = f"  {'─'*4}  {'─'*7}  {'─'*6}  {'─'*8}  {'─'*7}  {'─'*7}  {'─'*8}  {'─'*9}"
+        print(sep)
+        for r in self._records:
+            tc = green if r.total_ms < 5000 else (yellow if r.total_ms < 12000 else red)
+            print(
+                f"  {r.turn:>4}"
+                f"  {tc(f'{r.total_ms:>6.0f}')} "
+                f"  {r.context_build_ms:>6.1f}"
+                f"  {r.hashimoto_llm_ms:>8.0f}"
+                f"  {r.state_update_ms:>7.1f}"
+                f"  {r.question_prompt_ms:>7.2f}"
+                f"  {r.question_llm_ms:>8.0f}"
+                f"  {r.stt_to_question_prompt_ms:>9.0f}"
+            )
 
-        # ── 전체 프롬프트 출력 (복사용) ───────────────────────────────────
-        print(f"\n{DSEP}")
-        print(blue(bold(f"  ▶ LLM 전송 프롬프트 — Turn {self._turn}")))
-        print(f"  {dim('아래 내용을 외부 LLM(Claude.ai 등)에 복사·붙여넣기 하세요.')}")
-        print(DSEP)
-
-        # SYSTEM
-        print(f"\n{self._BLOCK}")
-        print(blue("[ SYSTEM ]"))
-        print(self._BLOCK)
-        print(build_system_prompt())
-
-        # 현재 유저 메시지 (슬롯 상태 + STT 포함)
-        print(f"\n{self._BLOCK}")
-        print(f"{blue('[ USER ]')}  {dim(f'Turn {self._turn}')}")
-        print(self._BLOCK)
-        print(user_msg)
-
-        print(f"\n{DSEP}")
-        print(blue(bold("  ▶ 프롬프트 끝 — 위 내용을 LLM에 넣고 응답을 아래에 붙여넣기")))
-        print(DSEP)
-
-        # ── 스키마 힌트 ──────────────────────────────────────────────────
-        print(_SCHEMA_HINT)
-        print(f"\n  {yellow('※ abduction 불필요 시 → \"abduction\": null')}")
-        print(f"  {yellow('※ fulfillment_score ≥ 0.7 → VERIFIED 처리')}")
-
-        # ── 사용자 입력 ───────────────────────────────────────────────────
-        print(f"\n{bold('LLM 응답 JSON을 붙여넣고 마지막 줄에 --- 를 입력하세요:')}")
-
-        while True:
-            raw = _read_until_end("")
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.DOTALL)
-            if not raw:
-                print(red("  입력이 비어있습니다. 다시 입력하세요."))
+        cols = [
+            ([r.total_ms                    for r in self._records], "Total(ms)"),
+            ([r.context_build_ms            for r in self._records], "①CTX build"),
+            ([r.hashimoto_llm_ms            for r in self._records], "②H-LLM"),
+            ([r.state_update_ms             for r in self._records], "③State upd"),
+            ([r.question_prompt_ms          for r in self._records], "④Q-Prompt"),
+            ([r.question_llm_ms             for r in self._records], "⑤Q-LLM"),
+            ([r.stt_to_question_prompt_ms   for r in self._records], "STT→Q-Prm ★"),
+        ]
+        n = len(self._records)
+        print(f"\n  {bold(f'집계 통계 (n={n})')}")
+        print(f"  {'단계':<14}  {'min':>7}  {'avg':>7}  {'p50':>7}  {'p95':>7}  {'max':>7}")
+        print(f"  {'─'*14}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}")
+        for values, label in cols:
+            s = self._stats(values)
+            if not s:
                 continue
-            try:
-                data = json.loads(raw)
-                result = LLMAnalysisOutput.model_validate(data)
-                return result
-            except json.JSONDecodeError as e:
-                print(red(f"\n  [JSON 파싱 오류] {e}"))
-                print("  다시 입력하세요. (--- 로 종료)\n")
-            except Exception as e:
-                print(red(f"\n  [스키마 검증 오류] {e}"))
-                print(f"  {dim('필드명·타입·필수값을 확인하고 다시 입력하세요. (--- 로 종료)')}\n")
-
-    def reset_history(self) -> None:
-        self._turn = 0
+            row = (
+                f"  {label:<14}  {s['min']:>7.0f}  {s['avg']:>7.0f}"
+                f"  {s['p50']:>7.0f}  {s['p95']:>7.0f}  {s['max']:>7.0f}"
+            )
+            print(bold(row) if "★" in label else row)
 
 
+def _show_latency_line(lat: TurnLatency) -> None:
+    def _ms(v: float, warn: float = 5000, crit: float = 10000) -> str:
+        color = green if v < warn else (yellow if v < crit else red)
+        return color(f"{v:.1f} ms")
+
+    print(f"  ① Context 빌드     : {_ms(lat.context_build_ms,   50,  200)}")
+    print(f"  ② Hashimoto LLM    : {_ms(lat.hashimoto_llm_ms)}")
+    print(f"  ③ State 업데이트   : {_ms(lat.state_update_ms,    50,  200)}")
+    print(f"  ④ 질문프롬프트 빌드: {_ms(lat.question_prompt_ms,  5,   20)}")
+    print(f"  ⑤ 질문 LLM        : {_ms(lat.question_llm_ms)}")
+    print(f"  {bold('STT → 질문프롬프트')} : "
+          f"{_ms(lat.stt_to_question_prompt_ms, 5000, 12000)}")
+    print(f"  {bold('Total'):<20}: {_ms(lat.total_ms, 5000, 15000)}")
+
+
+def wrap_engine_timing(engine: HashimotoEngine) -> HashimotoEngine:
+    """analyze_turn과 process_turn을 monkey-patch하여 단계별 타이밍을 엔진에 저장.
+
+    engine._get_engine_timing() → {"context_build_ms", "hashimoto_llm_ms", "state_update_ms"}
+    """
+    _t_proc_start: List[float] = [0.0]
+    _t_llm_start:  List[float] = [0.0]
+    _t_llm_end:    List[float] = [0.0]
+    _t_proc_end:   List[float] = [0.0]
+
+    orig_analyze = engine._llm.analyze_turn
+
+    def timed_analyze(*args, **kwargs):
+        _t_llm_start[0] = time.perf_counter()
+        result = orig_analyze(*args, **kwargs)
+        _t_llm_end[0] = time.perf_counter()
+        return result
+
+    engine._llm.analyze_turn = timed_analyze
+
+    orig_process = engine.process_turn
+
+    def timed_process(engine_input):
+        _t_proc_start[0] = time.perf_counter()
+        _t_llm_start[0] = _t_llm_end[0] = 0.0
+        result = orig_process(engine_input)
+        _t_proc_end[0] = time.perf_counter()
+        return result
+
+    engine.process_turn = timed_process
+
+    def _get_engine_timing() -> dict:
+        t0 = _t_proc_start[0]
+        ls = _t_llm_start[0]
+        le = _t_llm_end[0]
+        te = _t_proc_end[0]
+        if t0 == 0.0 or ls == 0.0:
+            return {"context_build_ms": 0.0, "hashimoto_llm_ms": 0.0, "state_update_ms": 0.0}
+        return {
+            "context_build_ms": (ls - t0) * 1000,
+            "hashimoto_llm_ms": (le - ls) * 1000,
+            "state_update_ms":  (te - le) * 1000,
+        }
+
+    engine._get_engine_timing = _get_engine_timing
+    return engine
 
 
 # ═══════════════════════════════════════════════════════════════
-# 수동 입력 모드 — Mock Engine
+# 질문 LLM — 프롬프트 빌드 + 클라이언트
 # ═══════════════════════════════════════════════════════════════
 
-class MockHashimotoEngine(HashimotoEngine):
-    """MockHashimotoLLMClient를 사용하는 테스트용 엔진. API 호출 없음."""
+def build_question_prompt(package: SapienStrategyPackage) -> str:
+    """SapienStrategyPackage → 질문LLM에 주입할 프롬프트."""
+    s = package.interaction_strategy
+    g = s.get("interviewer_persona_guidance", {})
+    c = s.get("current_context", {})
 
-    def __init__(self, root_topic: str, topic_queue: Optional[List[str]] = None) -> None:
-        super().__init__(root_topic, topic_queue)
-        self._llm = MockHashimotoLLMClient()  # 실제 클라이언트를 목업으로 교체
+    lines = [
+        "당신은 전문 면접관입니다. 아래 전략 지침을 바탕으로 면접 질문 하나를 생성하세요.",
+        "",
+        f"[현재 주제]    {c.get('topic', '')}",
+        f"[면접 목표]    {s.get('logic_goal', '')}",
+        f"[논리 간극]    {s.get('logical_gap_to_bridge', '')}",
+        f"[면접 의도]    {g.get('intent', '')}",
+        f"[집중 포인트]  {g.get('focus_point', '')}",
+        f"[감정 방향]    {g.get('emotion_direction', '')}",
+    ]
+    if c.get("topic_changed"):
+        lines.append("[주의] 주제가 전환되었습니다. 자연스럽게 전환 질문을 생성하세요.")
+    if c.get("multimodal_feedback_requirement"):
+        lines.append(f"[피드백 요구] {c['multimodal_feedback_requirement']}")
+    lines += [
+        "",
+        "규칙:",
+        "- 한국어로 면접 질문 하나만 출력하세요.",
+        "- 서문·설명·부연 없이 질문문 단독으로 출력합니다.",
+    ]
+    return "\n".join(lines)
 
-    @classmethod
-    def from_topics_manual(cls, topic_count: int = 3) -> "MockHashimotoEngine":
-        """LLM 없이 사용자가 직접 주제를 입력하여 초기화."""
-        print(f"\n면접 주제 {topic_count}개를 직접 입력하세요:")
-        topics = []
-        for i in range(topic_count):
-            t = input(f"  주제 {i+1}: ").strip()
-            if t:
-                topics.append(t)
-        if not topics:
-            topics = ["소프트웨어 엔지니어링 경험"]
-        while len(topics) < topic_count:
-            topics.append(f"추가 주제 {len(topics)+1}")
-        return cls(root_topic=topics[0], topic_queue=topics[1:])
 
+class QuestionLLMClient:
+    """SapienStrategyPackage 기반 면접 질문을 Gemini로 자동 생성."""
+
+    _SYSTEM = "당신은 한국어 면접 질문을 생성하는 전문 면접관 AI입니다."
+
+    def __init__(self) -> None:
+        import os
+        from google import genai
+        from google.genai import types
+        self._client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        self._config = types.GenerateContentConfig(
+            system_instruction=self._SYSTEM,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+
+    def generate(self, prompt: str) -> str:
+        response = self._client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=self._config,
+        )
+        return response.text.strip()
 
 
 # ═══════════════════════════════════════════════════════════════
-# 공통 — 초기화
+# 초기화
 # ═══════════════════════════════════════════════════════════════
 
-def select_mode() -> str:
-    print(f"\n{DSEP}\n  {bold('Hashimoto Engine — 테스트 콘솔')}\n{DSEP}")
-    print("\n실행 모드:")
-    print(f"  {cyan('1')}. 실제 LLM 모드   — Gemini API 호출 (크레딧 필요)")
-    print(f"  {cyan('2')}. 수동 입력 모드  — 내가 LLM 역할 (API 불필요)")
-    while True:
-        c = input("\n선택 [1/2]: ").strip()
-        if c in ("1", "2"):
-            return c
-        print("1 또는 2를 입력하세요.")
-
-
-def init_engine(mode: str) -> HashimotoEngine:
+def init_engine() -> HashimotoEngine:
+    print(f"\n{DSEP}\n  {bold('Hashimoto Engine — 테스트 콘솔 (API end-to-end)')}\n{DSEP}")
     print("\n초기화 방법:")
-    if mode == "2":
-        print(f"  {cyan('1')}. 주제 직접 입력")
-        print(f"  {cyan('2')}. 자기소개서 붙여넣기  → LLM이 주제 추출  {red('(API 필요)')}")
-    else:
-        print(f"  {cyan('1')}. 주제 직접 입력")
-        print(f"  {cyan('2')}. 자기소개서 붙여넣기  (LLM이 주제 자동 추출)")
+    print(f"  {cyan('1')}. 주제 직접 입력")
+    print(f"  {cyan('2')}. 자기소개서 붙여넣기  (LLM이 주제 자동 추출)")
 
     while True:
         choice = input("\n선택 [1/2]: ").strip()
 
         if choice == "1":
-            if mode == "2":
-                try:
-                    count = int(input("주제 개수 [기본 1]: ").strip() or "1")
-                except ValueError:
-                    count = 1
-                engine = MockHashimotoEngine.from_topics_manual(topic_count=count)
-            else:
-                topic = input("면접 주제: ").strip() or "소프트웨어 엔지니어링 경험"
-                engine = HashimotoEngine(root_topic=topic)
+            topic = input("면접 주제: ").strip() or "소프트웨어 엔지니어링 경험"
+            engine = HashimotoEngine(root_topic=topic)
             all_topics = [engine.current_topic] + engine.remaining_topics
             print(green("\n✓ 초기화 완료. 주제:"))
             for i, t in enumerate(all_topics, 1):
@@ -307,10 +344,6 @@ def init_engine(mode: str) -> HashimotoEngine:
             return engine
 
         elif choice == "2":
-            if mode == "2":
-                print(yellow("수동 입력 모드에서는 자기소개서 LLM 추출을 사용할 수 없습니다."))
-                print("주제 직접 입력(1)을 선택하세요.")
-                continue
             resume = _read_multiline("자기소개서를 붙여넣으세요 (빈 줄 2회로 종료):")
             if not resume:
                 print(red("자기소개서가 비어있습니다."))
@@ -333,7 +366,7 @@ def init_engine(mode: str) -> HashimotoEngine:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 공통 — 상태 표시
+# 상태 표시
 # ═══════════════════════════════════════════════════════════════
 
 def snapshot(engine: HashimotoEngine) -> dict:
@@ -400,7 +433,7 @@ def show_abduction(engine: HashimotoEngine) -> None:
     if es.verification_criteria:
         print("  기준     :")
         for c in es.verification_criteria:
-            print(f"    • {c.get('criterion','')}  (weight={c.get('weight','')})")
+            print(f"    • {c.criterion}  (weight={c.weight})")
 
 
 def show_state_commands(engine: HashimotoEngine) -> None:
@@ -503,6 +536,8 @@ def show_full_turn(
     before: dict,
     anxiety: float,
     package: SapienStrategyPackage,
+    question_text: Optional[str] = None,
+    latency: Optional[TurnLatency] = None,
 ) -> None:
     section("① 처리 전 상태")
     print(f"  주제   : {bold(before['topic'])}")
@@ -513,40 +548,50 @@ def show_full_turn(
         for sid, sc in before["slot_scores"].items():
             print(f"    {sid}: {score_bar(sc)}")
 
-    section("② LLM 분석 — 슬롯 평가")
+    section("② Hashimoto LLM 분석 — 슬롯 평가")
     show_slot_evaluations(engine)
 
-    section("② LLM 분석 — 가추법")
+    section("② Hashimoto LLM 분석 — 가추법 (명제 생성)")
     show_abduction(engine)
 
-    section("② LLM 분석 — 상태 명령")
+    section("② Hashimoto LLM 분석 — 상태 명령")
     show_state_commands(engine)
 
-    section("② LLM 분석 — 전략")
+    section("② Hashimoto LLM 분석 — 전략")
     show_strategy(engine)
 
     section("③ 주제 전환 판정")
     show_prune_verdict(engine, before, anxiety)
 
-    section("④ 처리 후 상태")
+    section("④ State 업데이트 후 상태")
     show_state_brief(engine, anxiety)
 
-    section("⑤ Sapien 전달 패키지")
+    section("⑤ Sapien 전달 패키지 (질문LLM 입력)")
     jprint(package)
+
+    if question_text is not None:
+        section("⑥ 생성된 면접 질문")
+        print(f"\n  {bold(question_text)}\n")
+
+    if latency:
+        section("⑦ Latency (단계별)")
+        _show_latency_line(latency)
 
 
 # ═══════════════════════════════════════════════════════════════
 # 도움말
 # ═══════════════════════════════════════════════════════════════
 
-def show_help(mode: str) -> None:
+def show_help() -> None:
     cmds = [
         ("state",        "현재 상태 요약"),
         ("stack",        "Priority Stack 전체 슬롯 상세"),
         ("slot <id>",    "특정 슬롯 전체 필드 조회"),
         ("topics",       "주제 목록 및 진행 현황"),
         ("archive",      "검증/거부 슬롯 아카이브 조회"),
-        ("llm",          "마지막 LLM 분석 원시 JSON"),
+        ("latency",      "파이프라인 단계별 지연시간 통계"),
+        ("question",     "마지막 생성된 면접 질문 출력"),
+        ("llm",          "마지막 Hashimoto LLM 분석 원시 JSON"),
         ("sapien",       "마지막 Sapien 패키지 원시 JSON"),
         ("sysprompt",    "시스템 프롬프트 전체 출력"),
         ("threshold",    "불안도별 depth 임계값 테이블"),
@@ -554,9 +599,7 @@ def show_help(mode: str) -> None:
         ("help",         "이 도움말"),
         ("exit / quit",  "종료"),
     ]
-    mode_label = "수동 입력" if mode == "2" else "실제 LLM"
-    print(f"\n  {bold(f'현재 모드: {mode_label}')}")
-    print(f"  {bold('STT 텍스트를 입력하면 턴을 처리합니다.')}")
+    print(f"\n  {bold('STT 텍스트를 입력하면 API end-to-end로 턴을 처리합니다.')}")
     print(f"\n  {'명령':<22} 설명")
     print(f"  {'─'*22} {'─'*32}")
     for cmd, desc in cmds:
@@ -568,13 +611,16 @@ def show_help(mode: str) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 def main() -> None:
-    mode = select_mode()
-    engine = init_engine(mode)
+    engine = init_engine()
+    tracker = LatencyTracker()
+    engine = wrap_engine_timing(engine)
+    question_client = QuestionLLMClient()
+
     turn = 1
-    last_package: Optional[SapienStrategyPackage] = None
+    last_package:  Optional[SapienStrategyPackage] = None
+    last_question: Optional[str] = None
     last_anxiety = 50.0
 
-    mode_tag = yellow("[수동]") if mode == "2" else green("[LLM]")
     print(f"\n{dim('명령어 목록: help')}")
 
     while True:
@@ -585,7 +631,7 @@ def main() -> None:
 
         print(
             f"\n{DSEP}\n"
-            f"  {mode_tag}  Turn {bold(turn)}  │  {bold(engine.current_topic)}"
+            f"  {green('[LLM]')}  Turn {bold(turn)}  │  {bold(engine.current_topic)}"
             f"  │  depth {depth_disp}\n"
             f"{DSEP}"
         )
@@ -601,7 +647,7 @@ def main() -> None:
             break
 
         elif cmd == "help":
-            show_help(mode)
+            show_help()
 
         elif cmd == "state":
             section("현재 엔진 상태")
@@ -637,6 +683,17 @@ def main() -> None:
             section("슬롯 아카이브")
             show_archive(engine)
 
+        elif cmd == "latency":
+            section("파이프라인 단계별 Latency")
+            tracker.show_table()
+
+        elif cmd == "question":
+            if last_question:
+                section("마지막 생성된 면접 질문")
+                print(f"\n  {bold(last_question)}\n")
+            else:
+                print(dim("  아직 생성된 질문 없음."))
+
         elif cmd == "llm":
             if engine._last_analysis:
                 section("마지막 LLM 분석 (raw JSON)")
@@ -666,13 +723,15 @@ def main() -> None:
                 print(f"  {a:>8}  {th:>10}  {diff}")
 
         elif cmd == "reset":
-            engine = init_engine(mode)
+            engine = init_engine()
+            engine = wrap_engine_timing(engine)
             turn = 1
-            last_package = None
-            last_anxiety = 50.0
+            last_package  = None
+            last_question = None
+            last_anxiety  = 50.0
 
         else:
-            # ── STT 입력으로 턴 처리 ──────────────────────────────────────
+            # ── STT 입력으로 턴 처리 (API end-to-end) ─────────────────────
             stt_text = raw
             print("\n멀티모달 신호 입력 (Enter = 기본값 50):")
             try:
@@ -688,14 +747,10 @@ def main() -> None:
             last_anxiety = a
 
             before = snapshot(engine)
-
-            # 수동 모드: 프롬프트 출력 + JSON 입력은 MockLLMClient 내부에서 처리
-            if mode == "2":
-                header(f"Turn {turn} — 프롬프트 출력 및 응답 입력")
-            else:
-                header(f"Turn {turn} 처리 중 ...")
+            header(f"Turn {turn} 처리 중 ...")
 
             try:
+                # ── ① ② ③ Hashimoto 파이프라인 ──────────────────────────
                 package = engine.process_turn(
                     EngineInput(
                         stt_text=stt_text,
@@ -704,7 +759,32 @@ def main() -> None:
                     )
                 )
                 last_package = package
-                show_full_turn(engine, before, a, package)
+
+                # ── ④ 질문LLM 프롬프트 빌드 ─────────────────────────────
+                t_qp = time.perf_counter()
+                q_prompt = build_question_prompt(package)
+                question_prompt_ms = (time.perf_counter() - t_qp) * 1000
+
+                # ── ⑤ 질문LLM 호출 ──────────────────────────────────────
+                header(f"Turn {turn} — 질문 생성 중 ...")
+                t_ql = time.perf_counter()
+                question_text = question_client.generate(q_prompt)
+                question_llm_ms = (time.perf_counter() - t_ql) * 1000
+                last_question = question_text
+
+                # ── 전체 TurnLatency 기록 ────────────────────────────────
+                et = engine._get_engine_timing()
+                lat = TurnLatency(
+                    turn=turn,
+                    context_build_ms=et["context_build_ms"],
+                    hashimoto_llm_ms=et["hashimoto_llm_ms"],
+                    state_update_ms=et["state_update_ms"],
+                    question_prompt_ms=question_prompt_ms,
+                    question_llm_ms=question_llm_ms,
+                )
+                tracker.record(lat)
+
+                show_full_turn(engine, before, a, package, question_text, lat)
                 turn += 1
 
             except Exception as e:
