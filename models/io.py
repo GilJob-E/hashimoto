@@ -23,10 +23,16 @@ class SlotEvaluationResult(BaseModel):
     response_type: Literal["ANSWERED", "INSUFFICIENT", "REFUSED"] = "ANSWERED"
 
 
+class CriterionInput(BaseModel):
+    # 닫힌 스키마 — Gemini response_schema는 개방형 객체(additionalProperties)를 거부함
+    criterion: str = ""
+    weight: float = 0.5
+
+
 class EmergentSlotData(BaseModel):
     slot_id: str
     proposition_statement: str
-    verification_criteria: List[Dict[str, Any]] = []
+    verification_criteria: List[CriterionInput] = []
     expected_answer_depth: str = "Conceptual"
 
 

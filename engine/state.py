@@ -184,8 +184,8 @@ class EngineState:
 
             criteria = [
                 VerificationCriterion(
-                    criterion=c.get("criterion", ""),
-                    weight=float(c.get("weight", 0.5)),
+                    criterion=c.criterion,
+                    weight=float(c.weight),
                 )
                 for c in emergent_slot_data.verification_criteria
             ]
