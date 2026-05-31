@@ -22,46 +22,36 @@ SYSTEM_PROMPT = """\
 3. 현재 Depth_Counter
 4. 멀티모달 신호 (불안도, 자신감 0-100)
 
-## 출력 요구사항 (반드시 JSON만 출력)
-아래 스키마를 **정확히** 따르는 JSON을 출력하세요. 설명 텍스트는 절대 포함하지 마세요.
+## 출력 필드 의미
+출력 JSON 스키마는 시스템이 강제합니다. 각 필드의 의미:
 
-```json
-{
-  "slot_evaluations": [
-    {
-      "slot_id": "<슬롯 ID>",
-      "fulfillment_score": 0.0,
-      "evidence": "<답변에서 발견한 근거 또는 부재 이유>",
-      "response_type": "ANSWERED | INSUFFICIENT | REFUSED"
-    }
-  ],
-  "abduction": {
-    "observed_gap": "<이번 답변에서 발견된 논리적 공백>",
-    "abductive_hypothesis": "<공백의 원인에 대한 가추적 가설>",
-    "parent_slot_id": "<이 연속 슬롯이 보완하는 부모 슬롯의 ID>",
-    "emergent_slot": {
-      "slot_id": "<고유 ID, snake_case>",
-      "proposition_statement": "<검증할 명제 (의문문 형태)>",
-      "verification_criteria": [
-        {"criterion": "<평가 기준>", "weight": 0.6}
-      ],
-      "expected_answer_depth": "Surface | Conceptual | Technical_Deep_Dive | Experiential"
-    }
-  },
-  "state_commands": {
-    "stack_action": "PUSH | NONE | PRUNE",
-    "depth_increment": 1,
-    "slots_to_pop": []
-  },
-  "strategy": {
-    "logic_goal": "<이번 질문의 논리적 목표>",
-    "logical_gap_to_bridge": "<메워야 할 논리적 공백>",
-    "interviewer_intent": "<면접관이 이 질문을 하는 숨은 의도>",
-    "focus_point": "<질문의 핵심 포인트>",
-    "suggested_tone": "Analytical_Pressure | Neutral_Curious | Supportive | Skeptical_Professional"
-  }
-}
-```
+slot_evaluations — 현재 활성 슬롯 각각에 대한 평가 목록:
+  slot_id           : 평가할 슬롯 ID
+  fulfillment_score : 명제 충족도 (0.0–1.0)
+  evidence          : 답변에서 발견한 근거, 또는 부재 이유
+  response_type     : ANSWERED | INSUFFICIENT | REFUSED
+
+abduction — 논리 공백이 발견될 때만 작성, 불필요하면 null:
+  observed_gap         : 이번 답변에서 발견된 논리적 공백
+  abductive_hypothesis : 공백 원인에 대한 가추적 가설
+  parent_slot_id       : 이 슬롯이 보완하는 부모 슬롯 ID
+  emergent_slot        : 새로 생성할 연속 슬롯
+    slot_id                  : snake_case 고유 ID
+    proposition_statement    : 검증할 명제 (의문문 형태)
+    verification_criteria    : [{criterion, weight}] 평가 기준 목록
+    expected_answer_depth    : Surface | Conceptual | Technical_Deep_Dive | Experiential
+
+state_commands — 스택 조작 명령:
+  stack_action    : PUSH(연속 슬롯 추가) | NONE(변경 없음) | PRUNE(주제 전환)
+  depth_increment : depth 증가량 (보통 1)
+  slots_to_pop    : 제거할 슬롯 ID 목록
+
+strategy — 다음 질문 전략:
+  logic_goal              : 이번 질문의 논리적 목표
+  logical_gap_to_bridge   : 메워야 할 논리적 공백
+  interviewer_intent      : 면접관의 숨은 의도
+  focus_point             : 질문의 핵심 포인트
+  suggested_tone          : Analytical_Pressure | Neutral_Curious | Supportive | Skeptical_Professional
 
 ## response_type 분류 기준
 - **ANSWERED**: 지원자가 답변을 시도함. fulfillment_score로 달성 정도를 나타냄.
@@ -73,13 +63,8 @@ SYSTEM_PROMPT = """\
 - **response_type == INSUFFICIENT**: abduction으로 연속 슬롯 생성 필수. parent_slot_id에 현재 슬롯 ID를 명시. stack_action = PUSH.
 - **response_type == REFUSED**: abduction 불필요. stack_action = NONE. 시스템이 자동 처리함.
 - **Depth_Counter가 임계값 도달 또는 스택이 비어있음**: PRUNE으로 주제 전환 유도.
-- **abduction이 불필요한 경우**: "abduction" 필드를 **null**로 설정. stack_action은 "NONE"이어야 합니다.
+- **abduction이 불필요한 경우**: abduction 필드를 null로 설정. stack_action은 "NONE"이어야 합니다.
 """
-
-_OUTPUT_REMINDER = (
-    "위 입력을 분석하고, 요구된 JSON 스키마만 출력하세요. "
-    "코드블록이나 추가 설명 없이 순수 JSON만 출력합니다."
-)
 
 
 def build_system_prompt() -> str:
@@ -108,6 +93,4 @@ def build_turn_message(
 [멀티모달 신호]
 - 불안도(Anxiety): {anxiety:.0f}/100
 - 자신감(Confidence): {confidence:.0f}/100
-
-{_OUTPUT_REMINDER}
 """

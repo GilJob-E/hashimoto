@@ -1,7 +1,5 @@
 import asyncio
-import json
 import os
-import re
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -27,7 +25,9 @@ class AsyncHashimotoLLMClient:
         self._client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         self._config = types.GenerateContentConfig(
             system_instruction=build_system_prompt(),
-            thinking_config=types.ThinkingConfig(thinking_budget=-1),
+            response_mime_type="application/json",
+            response_schema=LLMAnalysisOutput,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
 
     async def analyze_turn(
@@ -59,13 +59,7 @@ class AsyncHashimotoLLMClient:
                     raise
                 await asyncio.sleep(2 ** attempt)
 
-        return _parse_output(response.text)
+        return LLMAnalysisOutput.model_validate_json(response.text)
 
     def reset_history(self) -> None:
         pass
-
-
-def _parse_output(raw: str) -> LLMAnalysisOutput:
-    # Strip markdown code fences the model occasionally emits despite instructions
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.DOTALL)
-    return LLMAnalysisOutput.model_validate(json.loads(cleaned))
