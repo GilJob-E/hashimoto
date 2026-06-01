@@ -11,7 +11,7 @@ from models.io import LLMAnalysisOutput
 
 load_dotenv()
 
-_MODEL = "gemini-2.5-flash"
+_MODEL = "gemini-3.1-flash-lite"
 
 
 class AsyncHashimotoLLMClient:
