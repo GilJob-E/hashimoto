@@ -118,7 +118,7 @@ elif topic_switch_needed:
 
 ---
 
-## 6. 저지연 모드: 비동기 파이프라인
+## 6. 비동기 모드: 비동기 파이프라인
 
 **결정**: `LowLatencyHashimotoEngine`은 STT 도착 즉시 반환하고(`submit_turn`), Hashimoto 분석은 백그라운드에서 실행한다. Sapien은 `latest_strategy`를 블로킹 없이 읽어 질문을 생성한다.
 
