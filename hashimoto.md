@@ -30,6 +30,10 @@ Depth_Counter
 Int
 현재 주제(Root Topic) 내에서 파생되어 이어진 연속 질문의 횟수.
 
+Topic_Question_Counter
+Int
+현재 주제(Root Topic)에 대한 누적 질문 수. 임계값 도달 시 주제 전환을 강제함. (구현에서 추가된 상태 변수)
+
 
 
 4. 핵심 프로세스 (Processing Loop)
@@ -46,6 +50,8 @@ Hashimoto 엔진은 사용자의 응답으로부터 다음을 내부적으로 �
 신규 슬롯 생성: 미충족된 정보를 확인하기 위해 어떤 명제를 새로 세워야 하는가? (Proposition Generation)
 전략 수립: 사피엔이 질문할 때 참고할 수 있도록 '왜 이 질문이 필요한지'에 대한 논리적 근거(Reasoning)와 목표(Goal)를 생성.
 6.내부 데이터 예시(단순 예시이며 구현과정에서 논리적 허점이나 보완해야하는 부분이 있다면 변형된 형태를 이용할 수 있음)
+
+> ⚠️ 아래 JSON은 최초 기획 단계의 개념 예시입니다. 실제 구현 스키마(`LLMAnalysisOutput`, `SapienStrategyPackage`)는 일부 필드명·구조가 다릅니다(예: `response_type`, `slots_to_pop`, `topic_changed`, `transition_hint`, `resolved_history` 등). **권위 있는 현재 스키마는 `README.md`의 "LLM 출력 스키마" 절과 `models/io.py`를 참조하세요.**
 LLM은 이하의 형태로 현재 응답에 대해 새로운 slot명제를 생성한다
 {
   "gap_analysis": {

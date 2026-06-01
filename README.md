@@ -84,9 +84,12 @@ HashimotoEngine(
    └─ 각 슬롯: proposition, score, criteria, evidence
       연속 슬롯이면 Derived From + 부모 evidence 포함
         │
+1b. 이미 해소된 명제 요약 구성 (재질문 방지)
+   └─ verified_archive + refused_archive → [이미 해소된 명제] 블록
+        │
         ▼
 2. LLM 단일 호출 — 히스토리 없음, 슬롯 컨텍스트가 크로스-턴 메모리
-   (claude-opus-4-7 + Adaptive Thinking)
+   (gemini-3.1-flash-lite + structured output, thinking off)
    ├─ slot_evaluations  : 슬롯 평가 + response_type(ANSWERED/INSUFFICIENT/REFUSED)
    ├─ abduction         : 논리 공백 역추론 → 연속 슬롯 후보 + parent_slot_id
    ├─ state_commands    : PUSH / NONE / PRUNE
@@ -156,8 +159,8 @@ hashimoto/
 │
 └── llm/
     ├── prompts.py                 # 시스템 프롬프트 + 턴 메시지 빌더
-    ├── client.py                  # 동기 Anthropic SDK 래퍼
-    ├── async_client.py            # 비동기 Anthropic SDK 래퍼
+    ├── client.py                  # 동기 Gemini SDK 래퍼 (structured output)
+    ├── async_client.py            # 비동기 Gemini SDK 래퍼 (structured output)
     └── topic_extractor.py         # 자기소개서 → root_topic 추출
 ```
 
@@ -186,7 +189,9 @@ class Slot(BaseModel):
 | 모델 | 방향 | 설명 |
 |---|---|---|
 | `EngineInput` | 입력 | STT 텍스트 + 멀티모달 벡터(불안도/자신감) + 턴 번호 |
-| `LLMAnalysisOutput` | LLM → Engine | slot_evaluations + abduction + state_commands + strategy |
+| `HashimotoConfig` | 입력(세션) | 세션 단위 튜닝 파라미터. 엔진 생성 시 주입 (미지정 시 기본값) |
+| `LLMAnalysisOutput` | LLM → Engine | slot_evaluations + abduction + state_commands + strategy. `response_schema`로 구조 강제 |
+| `CriterionInput` | LLM → Engine | verification_criteria 항목(criterion+weight). Gemini structured output용 **닫힌 스키마** |
 | `SapienStrategyPackage` | 출력 | Sapien 엔진에 전달하는 최종 전략 패키지 |
 
 #### `engine/state.py`
@@ -260,21 +265,22 @@ engine = LowLatencyHashimotoEngine.from_resume(
 
 #### `llm/client.py` / `llm/async_client.py`
 
-- `gemini-2.5-pro`, `thinking_budget=-1`(dynamic thinking) 사용
+- 분석 모델 `gemini-3.1-flash-lite`, `thinking_budget=0`(저지연), **structured output**(`response_mime_type="application/json"` + `response_schema=LLMAnalysisOutput`) 사용. 응답은 `model_validate_json()`으로 직접 파싱하며 정규식 후처리가 없습니다.
+- 생성자는 `model` 인자를 받아 세션별 오버라이드를 지원합니다(`HashimotoConfig.analysis_model`). 미지정 시 `_MODEL` 기본값.
 - 시스템 프롬프트는 `__init__` 시점에 `GenerateContentConfig`에 고정 (`system_instruction`)
 - **Stateless 설계**: 대화 히스토리를 누적하지 않습니다. 매 턴마다 단일 `contents` 메시지만 전송합니다. 멀티턴 맥락은 `active_slots_context`(슬롯 충족도·증거)가 대신하며, 일반적인 대화 맥락 보존은 Sapien의 역할입니다.
 - `async_client.py`는 `client.aio.models.generate_content()`를 사용하며, `await` 기반으로 동작
 
 #### `llm/prompts.py`
 
-- `SYSTEM_PROMPT`: 역할 정의 + JSON 출력 스키마 + 판단 기준. **캐싱 대상(안정적 접두사)**이므로 동적 값을 포함하지 않습니다.
-- `build_turn_message()`: 매 턴마다 STT, 활성 슬롯, Depth_Counter, 멀티모달 신호를 주입합니다.
+- `SYSTEM_PROMPT`: 역할 정의 + 출력 필드 설명 + 판단 기준 + **재질문 금지 지침**. JSON 구조 자체는 `response_schema`가 강제하므로 스키마 예시는 포함하지 않습니다. **캐싱 대상(안정적 접두사)**이므로 동적 값을 포함하지 않습니다.
+- `build_turn_message()`: 매 턴마다 STT, 활성 슬롯, **이미 해소된 명제**(재질문 방지), Depth_Counter, 멀티모달 신호를 주입합니다.
 
 ---
 
 ## LLM 출력 스키마
 
-LLM은 매 턴 아래 JSON을 반환합니다. 슬롯의 스택 관리·아카이브 처리는 Python 시스템이 담당하며, LLM은 평가와 명제 생성만 수행합니다.
+LLM은 매 턴 아래 JSON을 반환합니다. 이 구조는 `response_schema=LLMAnalysisOutput`로 API 단에서 강제되며(`verification_criteria` 항목은 `CriterionInput`), 응답은 `model_validate_json()`으로 바로 파싱됩니다. 슬롯의 스택 관리·아카이브 처리는 Python 시스템이 담당하며, LLM은 평가와 명제 생성만 수행합니다.
 
 ```json
 {
@@ -409,7 +415,10 @@ asyncio.run(run())
     "depth_level": 2,
     "topic_changed": false,
     "transition_hint": null,
-    "multimodal_feedback_requirement": null
+    "multimodal_feedback_requirement": null,
+    "resolved_history": [
+      {"proposition": "Redux와 Context API의 선택 기준은?", "status": "검증됨"}
+    ]
   }
 }
 ```
@@ -419,6 +428,7 @@ asyncio.run(run())
 | `topic_changed` | `true`이면 root topic 전환 발생. Sapien이 주제 전환 멘트를 생성할 수 있음 |
 | `transition_hint` | `"direction_change"`이면 within-topic depth prune 발생. Sapien이 "잘 알겠습니다" / "자, 그러면" 등 추임새 삽입 권장. `null`이면 일반 진행 |
 | `multimodal_feedback_requirement` | 불안도 > 70 또는 자신감 < 30일 때 자동으로 채워져 Sapien의 어조 조정을 유도 |
+| `resolved_history` | 이미 검증·거부된 명제 목록(`proposition`+`status`). 질문 생성 시 재질문을 피하도록 참고. 빈 배열일 수 있음 |
 
 ### 아카이브 접근
 

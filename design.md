@@ -43,12 +43,19 @@
 
 **구현 위치**: `engine/state.py` → `should_depth_prune()`, `depth_prune()`, `should_switch_topic()`, `engine/hashimoto.py` / `engine/low_latency.py` step 5
 
-**판정 로직 (변경 금지)**
+**판정 로직 (변경 금지)** — 임계값은 세션 config에서 읽는다(§12)
 ```python
 llm_pruned = analysis.state_commands.stack_action.upper() == "PRUNE"
-depth_threshold = effective_depth_threshold(engine_input.multimodal.anxiety)
+depth_threshold = effective_depth_threshold(
+    engine_input.multimodal.anxiety,
+    self.config.prune_depth_threshold,
+    self.config.min_prune_depth_threshold,
+    self.config.anxiety_adjust,
+)
 
-topic_switch_needed = llm_pruned or self.state.should_switch_topic(TOPIC_QUESTION_THRESHOLD)
+topic_switch_needed = llm_pruned or self.state.should_switch_topic(
+    self.config.topic_question_threshold
+)
 
 depth_prune_needed = (
     not topic_switch_needed
@@ -58,7 +65,7 @@ depth_prune_needed = (
 if depth_prune_needed:
     → state.depth_prune(), transition_hint="direction_change"
 elif topic_switch_needed:
-    → EngineState 교체 또는 state.prune()
+    → EngineState(next_topic, self.config) 교체  (큐가 비면 state.prune() + _session_exhausted=True)
 ```
 
 **침범 금지 사항**
@@ -94,13 +101,15 @@ elif topic_switch_needed:
 
 **구현 위치**: `engine/state.py` → `effective_depth_threshold(anxiety)`
 
-**매핑 (조정 가능, 삭제 불가)**
+**매핑 (기본값 기준; `HashimotoConfig`로 세션별 조정 가능 — §12, 삭제 불가)**
 | anxiety | threshold |
 |---|---|
-| 0 – 50 | 5 (PRUNE_DEPTH_THRESHOLD) |
+| 0 – 50 | 5 (prune_depth_threshold 기본값) |
 | 75 | 4 |
 | 87.5 | 3 |
-| 100 | 2 (MIN_PRUNE_DEPTH_THRESHOLD) |
+| 100 | 2 (min_prune_depth_threshold 기본값) |
+
+`anxiety_adjust=False`이면 불안도와 무관하게 항상 base를 사용한다.
 
 **침범 금지 사항**
 - `effective_depth_threshold()`를 우회하여 `PRUNE_DEPTH_THRESHOLD` 상수를 `should_prune()`에 직접 전달하지 않는다.
@@ -122,7 +131,7 @@ elif topic_switch_needed:
 
 **침범 금지 사항**
 - `submit_turn()`을 블로킹으로 전환하지 않는다.
-- `AsyncAnthropic` 클라이언트(`llm/async_client.py`)를 동기 `Anthropic` 클라이언트로 교체하지 않는다.
+- 비동기 Gemini 클라이언트(`AsyncHashimotoLLMClient`, `client.aio.models`)를 동기 클라이언트로 교체하지 않는다.
 - 워커를 `threading.Thread`나 `concurrent.futures`로 교체하지 않는다. asyncio 단일 스레드 모델을 유지해야 상태 보호가 성립한다.
 
 ---
@@ -140,36 +149,42 @@ elif topic_switch_needed:
 
 ---
 
-## 8. LLM 모델 및 파라미터
+## 8. LLM 모델 및 파라미터 (저지연 최적화)
 
-**결정**: `gemini-2.5-pro`, `thinking_budget=-1`(dynamic thinking)을 사용한다.
+**결정**: 분석 호출은 `gemini-3.1-flash-lite` + `thinking_budget=0` + structured output(`response_schema`)을 사용한다. 이는 면접 분석(분류·명제 추출)이 긴 추론 체인을 요하지 않는다는 판단 하에 실시간 면접의 latency를 우선한 결정이며, 벤치마크로 검증되었다(gemini-2.5-flash 대비 약 1.6배 단축, 가추 품질 유지).
 
-**구현 위치**: `llm/client.py`, `llm/async_client.py`, `llm/topic_extractor.py` 상단 상수
+**구현 위치**: `llm/client.py`, `llm/async_client.py` 상단 상수 및 config; `llm/topic_extractor.py`
 
 ```python
-_MODEL = "gemini-2.5-pro"
+_MODEL = "gemini-3.1-flash-lite"
 
 # HashimotoLLMClient / AsyncHashimotoLLMClient
 self._config = types.GenerateContentConfig(
     system_instruction=build_system_prompt(),
-    thinking_config=types.ThinkingConfig(thinking_budget=-1),
+    response_mime_type="application/json",
+    response_schema=LLMAnalysisOutput,
+    thinking_config=types.ThinkingConfig(thinking_budget=0),
 )
 
-# topic_extractor는 thinking 불필요 — 별도 config 사용
+# topic_extractor — gemini-2.5-flash-lite, thinking 불필요
 types.GenerateContentConfig(system_instruction=_SYSTEM)
 ```
 
-**침범 금지 사항**
-- 모델을 비용 절감 목적으로 변경하지 않는다. 모델 변경은 명시적 요구사항이 있을 때만 한다.
-- `thinking_budget`을 `0`으로 설정하지 않는다. thinking을 비활성화하면 가추 추론 품질이 저하된다.
-- `thinking_budget=-1`(dynamic)을 고정 토큰 수로 교체하지 않는다. 동적 할당이 복잡도에 따라 비용과 품질을 자동 조정한다.
-- 환경 변수 키는 `GEMINI_API_KEY`를 사용한다. `ANTHROPIC_API_KEY`로 되돌리지 않는다.
+**불변 조건**
+- structured output을 유지한다: `response_mime_type="application/json"` + `response_schema=LLMAnalysisOutput`. JSON 파싱 견고성을 확보하고 시스템 프롬프트에서 스키마 서술을 제거하기 위함이다. 수동 정규식 파싱(`_parse_output`)으로 되돌리지 않는다.
+- `response_schema`에 들어가는 Pydantic 모델은 **닫힌 스키마**여야 한다. 개방형 `Dict[str, Any]`(additionalProperties)는 Gemini API가 전송 단계에서 거부한다. 그래서 `verification_criteria`는 `CriterionInput`으로 닫혀 있어야 한다.
+- 분석 모델은 세션별 `HashimotoConfig.analysis_model`로 오버라이드한다(§12). 클라이언트는 `model` 인자를 받아 `_MODEL`을 기본값으로 쓴다. 모델명을 다른 곳에 추가 하드코딩하지 않는다.
+- 환경 변수 키는 `GEMINI_API_KEY`를 사용한다.
+
+**변경 이력 / 재변경 시 규칙**
+- 초기 설계는 `gemini-2.5-pro` + `thinking_budget=-1`(품질 우선)이었으나, 실시간 면접의 latency 요구에 따라 저지연 구성으로 전환했다(사용자 승인 완료).
+- thinking을 재활성화하거나 상위 모델로 되돌릴 경우, 반드시 `test_console.py`의 latency 측정으로 회귀를 확인하고 재승인을 받는다.
 
 ---
 
 ## 9. 출력 스키마: SapienStrategyPackage
 
-**결정**: `interaction_strategy.current_context`에는 반드시 `topic`, `depth_level`, `topic_changed`, `transition_hint`, `multimodal_feedback_requirement` 다섯 필드가 포함된다.
+**결정**: `interaction_strategy.current_context`에는 반드시 `topic`, `depth_level`, `topic_changed`, `transition_hint`, `multimodal_feedback_requirement`, `resolved_history` 여섯 필드가 포함된다.
 
 **구현 위치**: `models/io.py` → `SapienStrategyPackage.from_analysis()`
 
@@ -177,6 +192,7 @@ types.GenerateContentConfig(system_instruction=_SYSTEM)
 - `topic_changed` 필드를 제거하거나 다른 위치로 이동하지 않는다. Sapien이 root topic 전환 감지에 사용한다.
 - `transition_hint` 필드를 제거하지 않는다. `"direction_change"` 값은 Sapien이 "잘 알겠습니다" / "자, 그러면" 등의 추임새를 삽입하는 신호다. `None`이면 추임새 없음.
 - `multimodal_feedback_requirement`의 자동 생성 로직(anxiety > 70, confidence < 30)을 삭제하지 않는다.
+- `resolved_history` 필드를 제거하지 않는다. 질문 LLM의 재질문 방지에 사용한다(§13).
 - `from_analysis()`의 `topic_changed` 파라미터 기본값은 `False`를 유지한다.
 - `from_analysis()`의 `transition_hint` 파라미터 기본값은 `None`을 유지한다.
 
@@ -259,7 +275,46 @@ turn N+1: to_context_str()가 Derived From + Evidence(부모 명제 + 기존 근
 - `Slot.to_context_str()`에서 `evidence` 필드 출력을 제거하지 않는다. 이것이 히스토리 없이 크로스-턴 맥락을 전달하는 유일한 수단이다.
 - 연속 슬롯 생성 시 부모 evidence 주입을 생략하지 않는다. 주입하지 않으면 LLM이 동일한 질문을 재생성할 수 있다.
 - `reset_history()`는 API 호환성을 위해 유지하되 no-op으로 남긴다. PRUNE 후 engine이 이를 호출하는 것은 설계 의도다(Section 2 참조).
-- `fulfillment_score` 임계값은 프롬프트(`SYSTEM_PROMPT`)와 코드(`FULFILLMENT_THRESHOLD = 0.7`) 양쪽에서 반드시 동일한 값을 사용한다. 어느 한쪽만 변경하지 않는다.
+- `fulfillment_score` 임계값은 프롬프트(`SYSTEM_PROMPT`)와 코드(`HashimotoConfig.fulfillment_threshold`, 기본 0.7) 양쪽에서 반드시 동일한 값을 사용한다. 어느 한쪽만 변경하지 않는다.
+
+---
+
+## 12. 세션 설정: HashimotoConfig
+
+**결정**: 면접 세션 단위 튜닝 파라미터를 `HashimotoConfig`(`models/io.py`)로 엔진 생성 시 주입한다. §4·§5·§8에 등장하는 임계값/모델 상수들은 이제 `HashimotoConfig`의 **기본값**이며, 오케스트레이터가 세션별로 오버라이드한다.
+
+**구현 위치**: `models/io.py` → `HashimotoConfig`; `engine/state.py`, `engine/hashimoto.py`, `engine/low_latency.py`로 주입
+
+**설정 항목**: `prune_depth_threshold`, `min_prune_depth_threshold`, `topic_question_threshold`, `fulfillment_threshold`, `active_window`, `anxiety_adjust`, `analysis_model`.
+
+**침범 금지 사항**
+- 모든 필드는 기본값을 가져 `HashimotoConfig()`만으로 기존 동작을 재현한다. 기본값을 바꿀 때는 §4·§5·§8의 표시값과 모듈 상수(`PRUNE_DEPTH_THRESHOLD` 등)도 함께 갱신한다.
+- config는 `EngineState`로 전달되며, **주제 전환·reset 시 새 `EngineState`에도 반드시 동일 config를 다시 전달**한다(`EngineState(next_topic, self.config)`). 누락하면 세션 중간에 기본값으로 되돌아간다.
+- `effective_depth_threshold(anxiety)`는 하위호환을 위해 모듈 상수를 기본 인자로 갖되, 엔진은 config 값(base/floor/adjust)을 명시 전달한다(§3 코드 참조).
+- 모듈 상수는 표시·하위호환·display용으로 유지한다. 제거하지 않는다.
+- `fulfillment_threshold`를 기본값(0.7)에서 바꾸면 `SYSTEM_PROMPT`의 "0.7" 서술과 불일치한다. 둘을 함께 조정한다(§11).
+
+**세션 종료 신호 / 팩토리**
+- 모든 주제가 소진되어 더 전환할 곳이 없으면 `_session_exhausted=True`가 set되고 `session_complete` 프로퍼티로 노출된다. 오케스트레이터는 이 신호로 면접 종료를 판단한다(api.py `/process_turn` 응답에도 포함).
+- `from_topics([...])` 팩토리로 자소서 없이 주제 목록만으로 초기화할 수 있다. config를 함께 받는다.
+
+---
+
+## 13. 재질문 방지: 해소 아카이브를 양 LLM에 주입
+
+**결정**: 이미 검증(verified)되거나 거부(refused)된 명제를 다시 묻지 않도록, 두 아카이브를 요약해 분석 LLM과 질문 LLM **양쪽** 컨텍스트에 주입한다.
+
+**구현 위치**: `engine/state.py` → `resolved_context_str()`, `resolved_history_list()`; `llm/prompts.py` → `build_turn_message`의 `[이미 해소된 명제]` 블록 + `SYSTEM_PROMPT`의 재질문 금지 지침; `models/io.py` → `SapienStrategyPackage.current_context.resolved_history`; 두 엔진의 `process_turn` / `_run_pipeline`.
+
+**주입 시점 (변경 금지)**
+- 분석 LLM용 `resolved_context`는 LLM 호출 **전**에 생성한다 → 이전 턴까지의 해소분이 가추(abduction) 단계에서 중복 슬롯 생성을 막는다.
+- 질문 LLM용 `resolved_history`는 이번 턴 해소분 적재 **후**에 패키지에 싣는다 → 방금 답한/거부한 슬롯도 즉시 재질문 방지.
+
+**침범 금지 사항**
+- `SYSTEM_PROMPT`의 재질문 금지 지침("의미적으로 중복되는 emergent_slot 생성 금지", "거부된 명제 재추궁 금지")을 제거하지 않는다.
+- `resolved_history`를 `SapienStrategyPackage.current_context`에서 제거하지 않는다(§9).
+- 토큰 관리를 위해 분석용은 `slot_id+명제+상태`, 질문용은 `명제+상태`만 싣고 evidence 전문은 싣지 않는다.
+- 아카이브는 엔진 레벨(`verified_archive`/`refused_archive` 공개 프로퍼티)이며 topic 전환 후에도 누적된다(§10). 따라서 주제 간 재질문도 방어된다.
 
 ---
 
@@ -273,7 +328,8 @@ turn N+1: to_context_str()가 Derived From + Evidence(부모 명제 + 기존 근
 - [ ] `messages` 파라미터가 단일 user 메시지만 포함하는가? (히스토리 누적 금지)
 - [ ] `SYSTEM_PROMPT`의 fulfillment 임계값과 `FULFILLMENT_THRESHOLD` 상수가 일치하는가?
 - [ ] `system_instruction`이 `__init__` 시점의 `GenerateContentConfig`에 고정되어 있는가?
-- [ ] `thinking_budget=-1`이 유지되는가? (`0`으로 설정되어 thinking이 비활성화되지 않았는가?)
+- [ ] 분석 config가 structured output(`response_mime_type` + `response_schema`)과 `thinking_budget=0`을 유지하는가? (모델/thinking 변경 시 latency를 재측정·재승인했는가?)
+- [ ] `response_schema`에 쓰이는 모델이 닫힌 스키마인가? (개방형 `Dict[str, Any]` 미사용)
 
 **슬롯 해소 흐름**
 - [ ] `apply_evaluations()` → `process_slot_resolutions()` → `apply_state_commands()` 순서가 유지되는가?
@@ -291,6 +347,12 @@ turn N+1: to_context_str()가 Derived From + Evidence(부모 명제 + 기존 근
 - [ ] `depth_prune()` 호출 시 `topic_question_counter`가 리셋되지 않는가?
 - [ ] `topic_changed`와 `transition_hint` 플래그가 `SapienStrategyPackage`에 포함되어 반환되는가?
 
+**세션 설정 / 재질문 방지**
+- [ ] 주제 전환·reset 시 새 `EngineState`에 `self.config`를 다시 전달하는가? (§12)
+- [ ] `effective_depth_threshold` / `should_switch_topic`에 config 값을 전달하는가? (모듈 상수 직접 사용 금지)
+- [ ] `resolved_context`를 분석 LLM 호출 **전**, `resolved_history`를 해소분 적재 **후** 패키지에 싣는가? (§13)
+- [ ] `SYSTEM_PROMPT`의 재질문 금지 지침과 `current_context.resolved_history`가 유지되는가?
+
 **아키텍처**
 - [ ] `LowLatencyHashimotoEngine`의 워커가 단일 태스크인가?
-- [ ] `from_resume()`이 턴 루프 외부에서만 호출되는가?
+- [ ] `from_resume()` / `from_topics()`가 턴 루프 외부에서만 호출되는가?
