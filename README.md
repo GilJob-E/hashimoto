@@ -198,12 +198,20 @@ class Slot(BaseModel):
 - `depth_counter`: 현재 주제 연속 질문 횟수 (branch depth)
 - `topic_question_counter`: 현재 root_topic 내 누적 질문 수
 
+위 상수들은 `HashimotoConfig`의 **기본값**이며, 세션별 튜닝은 엔진 생성 시 `config`로 주입합니다 (미지정 시 기본값 사용).
+
 ```python
-FULFILLMENT_THRESHOLD = 0.7      # 이 이상이면 VERIFIED
-ACTIVE_WINDOW = 3                 # Multi-Slot Scanning 윈도우 크기
-PRUNE_DEPTH_THRESHOLD = 5         # within-topic depth prune 발동 깊이
-MIN_PRUNE_DEPTH_THRESHOLD = 2     # 불안도 최고 시 최소 임계값
-TOPIC_QUESTION_THRESHOLD = 10     # root topic 강제 전환 누적 질문 수
+from models.io import HashimotoConfig
+
+config = HashimotoConfig(
+    prune_depth_threshold=5,        # within-topic depth prune 발동 깊이
+    min_prune_depth_threshold=2,    # 불안도 최고 시 최소 임계값
+    topic_question_threshold=10,    # root topic 강제 전환 누적 질문 수
+    fulfillment_threshold=0.7,      # 이 이상이면 VERIFIED
+    active_window=3,                # Multi-Slot Scanning 윈도우 크기
+    anxiety_adjust=True,            # 불안도에 따른 depth 임계값 자동 하향
+    analysis_model=None,            # 분석 LLM 모델 오버라이드 (None=기본)
+)
 ```
 
 #### `engine/hashimoto.py`
@@ -214,10 +222,14 @@ TOPIC_QUESTION_THRESHOLD = 10     # root topic 강제 전환 누적 질문 수
 # 단일 주제
 engine = HashimotoEngine(root_topic="...")
 
+# 주제 목록 직접 지정
+engine = HashimotoEngine.from_topics(["주제1", "주제2"], config=config)
+
 # 자기소개서 기반 다중 주제
-engine = HashimotoEngine.from_resume(resume_text, topic_count=3)
+engine = HashimotoEngine.from_resume(resume_text, topic_count=3, config=config)
 print(engine.current_topic)     # 현재 주제
 print(engine.remaining_topics)  # 대기 중인 주제 목록
+print(engine.session_complete)  # 모든 주제 소진 시 True (세션 종료 신호)
 ```
 
 #### `engine/low_latency.py`

@@ -21,7 +21,8 @@ class AsyncHashimotoLLMClient:
     시스템 프롬프트는 상수이므로 __init__ 시점에 config에 고정한다.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model: str | None = None) -> None:
+        self._model = model or _MODEL
         self._client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         self._config = types.GenerateContentConfig(
             system_instruction=build_system_prompt(),
@@ -49,7 +50,7 @@ class AsyncHashimotoLLMClient:
         for attempt in range(6):
             try:
                 response = await self._client.aio.models.generate_content(
-                    model=_MODEL,
+                    model=self._model,
                     contents=user_message,
                     config=self._config,
                 )

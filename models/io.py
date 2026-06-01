@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Any, Dict, List, Literal, Optional
 
 
@@ -11,6 +11,38 @@ class EngineInput(BaseModel):
     stt_text: str
     multimodal: MultimodalVector = Field(default_factory=MultimodalVector)
     turn_number: int = 1
+
+
+# ── Session configuration ─────────────────────────────────────────────────────
+
+class HashimotoConfig(BaseModel):
+    """면접 세션 단위 튜닝 파라미터. 오케스트레이터가 세션 시작 시 엔진에 주입한다.
+
+    모든 필드는 기본값을 가지므로 HashimotoConfig() 만으로 기존 동작을 그대로 재현한다.
+    """
+
+    # 주제 내 최대 꼬리질문 깊이 — within-topic depth prune 발동 깊이
+    prune_depth_threshold: int = Field(default=5, ge=1)
+    # 불안도 최고 시 적용되는 depth 임계값 하한
+    min_prune_depth_threshold: int = Field(default=2, ge=1)
+    # root topic당 누적 질문 수 상한 — 도달 시 주제 전환
+    topic_question_threshold: int = Field(default=10, ge=1)
+    # 슬롯 검증(VERIFIED) 판정 점수 컷오프
+    fulfillment_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    # Multi-Slot Scanning 윈도우 — LLM이 동시에 고려하는 상위 슬롯 수
+    active_window: int = Field(default=3, ge=1)
+    # 불안도에 따른 depth 임계값 자동 하향 사용 여부 (False면 항상 base 사용)
+    anxiety_adjust: bool = True
+    # 분석 LLM 모델 오버라이드 (None이면 클라이언트 기본 모델)
+    analysis_model: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "HashimotoConfig":
+        if self.min_prune_depth_threshold > self.prune_depth_threshold:
+            raise ValueError(
+                "min_prune_depth_threshold는 prune_depth_threshold 이하여야 합니다."
+            )
+        return self
 
 
 # ── LLM output schema ────────────────────────────────────────────────────────

@@ -1,13 +1,19 @@
+from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from engine.hashimoto import HashimotoEngine
-from models.io import EngineInput
+from models.io import EngineInput, HashimotoConfig
 
 app = FastAPI(title="Hashimoto API", description="API for Hashimoto Interview Engine")
 
 class InitRequest(BaseModel):
-    resume_text: str
+    # resume_text 또는 topics 중 하나로 초기화. 둘 다 주면 topics 우선.
+    resume_text: Optional[str] = None
+    topics: Optional[List[str]] = None
     topic_count: int = 3
+    # 세션 단위 튜닝 (미지정 시 기본값)
+    config: Optional[HashimotoConfig] = None
 
 class ProcessTurnRequest(BaseModel):
     stt_text: str
@@ -22,9 +28,18 @@ engine: HashimotoEngine | None = None
 def init_engine(request: InitRequest):
     global engine
     try:
-        engine = HashimotoEngine.from_resume(request.resume_text, topic_count=request.topic_count)
+        if request.topics:
+            engine = HashimotoEngine.from_topics(request.topics, config=request.config)
+        elif request.resume_text:
+            engine = HashimotoEngine.from_resume(
+                request.resume_text, topic_count=request.topic_count, config=request.config
+            )
+        else:
+            raise HTTPException(status_code=400, detail="resume_text 또는 topics 중 하나가 필요합니다.")
         topics = [engine.current_topic] + engine.remaining_topics
         return {"topics": topics, "current_topic": engine.current_topic}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -40,7 +55,10 @@ def process_turn(request: ProcessTurnRequest):
             turn_number=request.turn_number,
         )
         strategy = engine.process_turn(input_data)
-        return strategy.interaction_strategy
+        return {
+            **strategy.interaction_strategy,
+            "session_complete": engine.session_complete,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

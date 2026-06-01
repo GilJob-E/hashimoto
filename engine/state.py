@@ -1,9 +1,15 @@
 import math
 from typing import Dict, List, Optional, Tuple
 from models.slot import Slot, SlotStatus, VerificationCriterion
-from models.io import EmergentSlotData, SlotEvaluationResult, StateCommands
+from models.io import (
+    EmergentSlotData,
+    HashimotoConfig,
+    SlotEvaluationResult,
+    StateCommands,
+)
 
 
+# 기본값 — HashimotoConfig의 default와 동일하게 유지한다 (하위호환·표시용 상수).
 FULFILLMENT_THRESHOLD = 0.7
 # How many top slots the LLM considers simultaneously (Multi-Slot Scanning)
 ACTIVE_WINDOW = 3
@@ -15,21 +21,26 @@ MIN_PRUNE_DEPTH_THRESHOLD = 2
 TOPIC_QUESTION_THRESHOLD = 10
 
 
-def effective_depth_threshold(anxiety: float) -> int:
+def effective_depth_threshold(
+    anxiety: float,
+    base: int = PRUNE_DEPTH_THRESHOLD,
+    floor: int = MIN_PRUNE_DEPTH_THRESHOLD,
+    adjust: bool = True,
+) -> int:
     """불안도가 높을수록 depth 임계값을 낮춰 주제를 더 빨리 전환한다.
 
-    anxiety 0–50  : PRUNE_DEPTH_THRESHOLD (5) — 변화 없음
-    anxiety 50–100: 선형으로 MIN_PRUNE_DEPTH_THRESHOLD (2)까지 감소
+    anxiety 0–50  : base (기본 5) — 변화 없음
+    anxiety 50–100: 선형으로 floor (기본 2)까지 감소
 
-    anxiety=75  → 4  |  anxiety=87.5 → 3  |  anxiety=100 → 2
+    base/floor 기본값은 모듈 상수이며, 세션별 HashimotoConfig 값을 넘기면
+    해당 세션 설정으로 계산한다. adjust=False면 불안도와 무관하게 base를 반환.
+
+    anxiety=75  → 4  |  anxiety=87.5 → 3  |  anxiety=100 → 2  (base=5, floor=2 기준)
     """
-    if anxiety <= 50.0:
-        return PRUNE_DEPTH_THRESHOLD
+    if not adjust or anxiety <= 50.0:
+        return base
     scale = (anxiety - 50.0) / 50.0
-    return max(
-        MIN_PRUNE_DEPTH_THRESHOLD,
-        math.ceil(PRUNE_DEPTH_THRESHOLD - scale * (PRUNE_DEPTH_THRESHOLD - MIN_PRUNE_DEPTH_THRESHOLD)),
-    )
+    return max(floor, math.ceil(base - scale * (base - floor)))
 
 
 class EngineState:
@@ -40,8 +51,9 @@ class EngineState:
       - Depth_Counter   : 현재 루트 토픽 내 연속 질문 횟수
     """
 
-    def __init__(self, root_topic: str) -> None:
+    def __init__(self, root_topic: str, config: Optional[HashimotoConfig] = None) -> None:
         self.root_topic: str = root_topic
+        self.config: HashimotoConfig = config or HashimotoConfig()
         self.global_slot_map: Dict[str, Slot] = {}
         self.priority_stack: List[str] = []
         self.depth_counter: int = 0
@@ -90,7 +102,7 @@ class EngineState:
 
     def active_slots(self) -> List[Slot]:
         """Multi-Slot Scanning에서 참조할 상위 N개 슬롯."""
-        window_ids = self.priority_stack[:ACTIVE_WINDOW]
+        window_ids = self.priority_stack[:self.config.active_window]
         return [self.global_slot_map[sid] for sid in window_ids if sid in self.global_slot_map]
 
     def peek(self) -> Optional[Slot]:
@@ -104,6 +116,7 @@ class EngineState:
         """Multi-Slot Scanning 결과를 Global_Slot_Map에 반영한다.
         Python 보정: LLM이 ANSWERED로 분류했더라도 score < threshold 이면 INSUFFICIENT로 교정.
         """
+        threshold = self.config.fulfillment_threshold
         for ev in evaluations:
             if ev.slot_id not in self.global_slot_map:
                 continue
@@ -112,10 +125,10 @@ class EngineState:
             slot.evidence = ev.evidence
             # Python-enforced override: ANSWERED + 낮은 점수 → INSUFFICIENT
             effective_type = ev.response_type.upper()
-            if effective_type == "ANSWERED" and not slot.is_verified(FULFILLMENT_THRESHOLD):
+            if effective_type == "ANSWERED" and not slot.is_verified(threshold):
                 effective_type = "INSUFFICIENT"
             slot.resolution_type = effective_type
-            if slot.is_verified(FULFILLMENT_THRESHOLD):
+            if slot.is_verified(threshold):
                 slot.status = SlotStatus.VERIFIED
 
     def process_slot_resolutions(
