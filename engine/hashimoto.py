@@ -2,7 +2,12 @@ from typing import List, Optional
 
 from llm.client import HashimotoLLMClient
 from llm.topic_extractor import extract_topics
-from engine.state import EngineState, effective_depth_threshold
+from engine.state import (
+    EngineState,
+    effective_depth_threshold,
+    resolved_context_str,
+    resolved_history_list,
+)
 from models.io import (
     EngineInput,
     HashimotoConfig,
@@ -92,12 +97,25 @@ class HashimotoEngine:
         """
         return self._session_exhausted
 
+    @property
+    def verified_archive(self) -> List[Slot]:
+        """충족(검증)으로 해소된 슬롯 누적 목록 (전 주제 포함)."""
+        return list(self._verified_archive)
+
+    @property
+    def refused_archive(self) -> List[Slot]:
+        """응답 거부로 해소된 슬롯 누적 목록 (전 주제 포함)."""
+        return list(self._refused_archive)
+
     # ── Core ──────────────────────────────────────────────────────────────────
 
     def process_turn(self, engine_input: EngineInput) -> SapienStrategyPackage:
         # 1. Build slot context string (Multi-Slot Scanning window)
         active_slots = self.state.active_slots()
         active_slots_context = "\n".join(s.to_context_str() for s in active_slots)
+
+        # 1b. 이미 해소된 명제 요약 (재질문 방지) — 이번 턴 해소분 적재 전 시점
+        resolved_context = resolved_context_str(self._verified_archive, self._refused_archive)
 
         # 2. Single LLM call
         analysis = self._last_analysis = self._llm.analyze_turn(
@@ -106,6 +124,7 @@ class HashimotoEngine:
             depth_counter=self.state.depth_counter,
             anxiety=engine_input.multimodal.anxiety,
             confidence=engine_input.multimodal.confidence,
+            resolved_context=resolved_context,
         )
 
         # 3. 슬롯 평가 반영 (response_type Python 교정 포함)
@@ -164,6 +183,7 @@ class HashimotoEngine:
             self._last_prune_trigger = "none"
 
         # 6. Package strategy for Sapien
+        # resolved_history는 이번 턴 해소분까지 반영 (방금 답한 슬롯도 재질문 방지)
         return SapienStrategyPackage.from_analysis(
             strategy=analysis.strategy,
             topic=self.state.root_topic,
@@ -171,6 +191,7 @@ class HashimotoEngine:
             multimodal=engine_input.multimodal,
             topic_changed=topic_changed,
             transition_hint=transition_hint,
+            resolved_history=resolved_history_list(self._verified_archive, self._refused_archive),
         )
 
     def reset(self, new_topic: str) -> None:

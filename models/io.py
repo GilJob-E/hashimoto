@@ -112,6 +112,7 @@ class SapienStrategyPackage(BaseModel):
         multimodal: MultimodalVector,
         topic_changed: bool = False,
         transition_hint: Optional[str] = None,
+        resolved_history: Optional[List[Dict[str, Any]]] = None,
     ) -> "SapienStrategyPackage":
         adjust_note = ""
         if multimodal.anxiety > 70:
@@ -134,6 +135,8 @@ class SapienStrategyPackage(BaseModel):
                     "topic_changed": topic_changed,
                     "transition_hint": transition_hint,
                     "multimodal_feedback_requirement": adjust_note or None,
+                    # 이미 검증/거부된 명제 — 질문 LLM이 재질문하지 않도록 전달
+                    "resolved_history": resolved_history or [],
                 },
             }
         )

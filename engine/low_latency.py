@@ -20,7 +20,12 @@ from typing import Callable, List, Optional
 
 from llm.async_client import AsyncHashimotoLLMClient
 from llm.topic_extractor import extract_topics
-from engine.state import EngineState, effective_depth_threshold
+from engine.state import (
+    EngineState,
+    effective_depth_threshold,
+    resolved_context_str,
+    resolved_history_list,
+)
 from models.io import EngineInput, HashimotoConfig, SapienStrategyPackage
 from models.slot import Slot
 
@@ -150,6 +155,16 @@ class LowLatencyHashimotoEngine:
         return self._session_exhausted
 
     @property
+    def verified_archive(self) -> List[Slot]:
+        """충족(검증)으로 해소된 슬롯 누적 목록 (전 주제 포함)."""
+        return list(self._verified_archive)
+
+    @property
+    def refused_archive(self) -> List[Slot]:
+        """응답 거부로 해소된 슬롯 누적 목록 (전 주제 포함)."""
+        return list(self._refused_archive)
+
+    @property
     def is_busy(self) -> bool:
         """큐에 미처리 항목이 있거나 워커가 처리 중이면 True."""
         return not self._queue.empty()
@@ -187,6 +202,9 @@ class LowLatencyHashimotoEngine:
         active_slots = self.state.active_slots()
         active_slots_context = "\n".join(s.to_context_str() for s in active_slots)
 
+        # 1b. 이미 해소된 명제 요약 (재질문 방지) — 이번 턴 해소분 적재 전 시점
+        resolved_context = resolved_context_str(self._verified_archive, self._refused_archive)
+
         # 2. LLM 비동기 호출
         analysis = await self._llm.analyze_turn(
             stt_text=engine_input.stt_text,
@@ -194,6 +212,7 @@ class LowLatencyHashimotoEngine:
             depth_counter=self.state.depth_counter,
             anxiety=engine_input.multimodal.anxiety,
             confidence=engine_input.multimodal.confidence,
+            resolved_context=resolved_context,
         )
 
         # 3. 슬롯 평가 반영 (response_type Python 교정 포함)
@@ -257,4 +276,5 @@ class LowLatencyHashimotoEngine:
             multimodal=engine_input.multimodal,
             topic_changed=topic_changed,
             transition_hint=transition_hint,
+            resolved_history=resolved_history_list(self._verified_archive, self._refused_archive),
         )

@@ -38,6 +38,7 @@ class AsyncHashimotoLLMClient:
         depth_counter: int,
         anxiety: float,
         confidence: float,
+        resolved_context: str = "",
     ) -> LLMAnalysisOutput:
         user_message = build_turn_message(
             stt_text=stt_text,
@@ -45,6 +46,7 @@ class AsyncHashimotoLLMClient:
             depth_counter=depth_counter,
             anxiety=anxiety,
             confidence=confidence,
+            resolved_context=resolved_context,
         )
 
         for attempt in range(6):

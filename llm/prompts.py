@@ -64,6 +64,11 @@ strategy — 다음 질문 전략:
 - **response_type == REFUSED**: abduction 불필요. stack_action = NONE. 시스템이 자동 처리함.
 - **Depth_Counter가 임계값 도달 또는 스택이 비어있음**: PRUNE으로 주제 전환 유도.
 - **abduction이 불필요한 경우**: abduction 필드를 null로 설정. stack_action은 "NONE"이어야 합니다.
+
+## 재질문 방지 (중요)
+입력에 [이미 해소된 명제] 목록이 제공되면, 그 명제들은 이미 검증되었거나(검증됨) 지원자가 답변을 거부한(거부됨) 것입니다.
+- 해당 명제와 **의미적으로 중복되는** emergent_slot을 생성하지 마세요.
+- 거부됨(거부됨)으로 표시된 명제는 다시 추궁하지 말고, 다른 각도의 새로운 논리 공백을 찾으세요.
 """
 
 
@@ -77,7 +82,13 @@ def build_turn_message(
     depth_counter: int,
     anxiety: float,
     confidence: float,
+    resolved_context: str = "",
 ) -> str:
+    resolved_block = ""
+    if resolved_context:
+        resolved_block = (
+            f"\n[이미 해소된 명제 — 재질문 금지]\n{resolved_context}\n"
+        )
     return f"""\
 --- 이번 턴 분석 요청 ---
 
@@ -86,7 +97,7 @@ def build_turn_message(
 
 [현재 Priority_Stack 상단 슬롯]
 {active_slots_context if active_slots_context else "(슬롯 없음 - 새 주제 설정 필요)"}
-
+{resolved_block}
 [Depth_Counter]
 {depth_counter}
 

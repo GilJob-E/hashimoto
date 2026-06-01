@@ -287,11 +287,20 @@ def build_question_prompt(package: SapienStrategyPackage) -> str:
         lines.append("[주의] 주제가 전환되었습니다. 자연스럽게 전환 질문을 생성하세요.")
     if c.get("multimodal_feedback_requirement"):
         lines.append(f"[피드백 요구] {c['multimodal_feedback_requirement']}")
+
+    resolved = c.get("resolved_history") or []
+    if resolved:
+        lines.append("")
+        lines.append("[이미 질문·답변된 내용 — 재질문 금지]")
+        for r in resolved:
+            lines.append(f"- ({r.get('status', '')}) {r.get('proposition', '')}")
+
     lines += [
         "",
         "규칙:",
         "- 한국어로 면접 질문 하나만 출력하세요.",
         "- 서문·설명·부연 없이 질문문 단독으로 출력합니다.",
+        "- 위 '이미 질문·답변된 내용'과 중복되는 질문은 절대 생성하지 마세요.",
     ]
     return "\n".join(lines)
 

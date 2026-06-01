@@ -43,6 +43,36 @@ def effective_depth_threshold(
     return max(floor, math.ceil(base - scale * (base - floor)))
 
 
+# ── 해소 슬롯 요약 (재질문 방지용 — 분석/질문 LLM 공용) ────────────────────────
+
+def build_resolved_records(
+    verified: List[Slot], refused: List[Slot]
+) -> List[Tuple[str, str, str]]:
+    """(slot_id, proposition_statement, status) 튜플 목록. status ∈ {검증됨, 거부됨}."""
+    records: List[Tuple[str, str, str]] = []
+    for s in verified:
+        records.append((s.slot_id, s.proposition_statement, "검증됨"))
+    for s in refused:
+        records.append((s.slot_id, s.proposition_statement, "거부됨"))
+    return records
+
+
+def resolved_context_str(verified: List[Slot], refused: List[Slot]) -> str:
+    """분석 LLM용 — slot_id 포함 간결 요약. 비어있으면 빈 문자열."""
+    return "\n".join(
+        f"- [{status}] {sid}: {prop}"
+        for sid, prop, status in build_resolved_records(verified, refused)
+    )
+
+
+def resolved_history_list(verified: List[Slot], refused: List[Slot]) -> List[dict]:
+    """질문 LLM 패키지용 — proposition + status만 (토큰 절감, slot_id 제외)."""
+    return [
+        {"proposition": prop, "status": status}
+        for _sid, prop, status in build_resolved_records(verified, refused)
+    ]
+
+
 class EngineState:
     """
     핵심 상태 변수를 관리한다.
