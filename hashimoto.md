@@ -14,6 +14,7 @@ Sapien Engine: Hashimoto가 제공한 질문 방향성을 프롬프트로 입력
 3.1 Input
 STT Context: 사용자의 발화 텍스트 전사본.
 Multimodal Vector: 수치화된 지표 (Anxiety, Confidence 등, $0 \sim 100$).
+(선택) Job Posting: 인스턴스 시 채용공고 URL을 주면 공고를 1회 분석해 세션 집중 키워드를 도출한다. 키워드는 엔진 내부 로직에서 쓰이지 않고 Sapien 전달 패키지의 부가 메타정보로만 포함된다. (구현 세부는 README / design.md §14 참조)
 3.2 Hashimoto Engine (Internal Logic & State)
 엔진은 내부적으로 다음 상태 변수를 관리하며 전체 대화를 제어할 수 있음.
 

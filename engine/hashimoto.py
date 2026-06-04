@@ -51,15 +51,38 @@ class HashimotoEngine:
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _apply_job_url(config: Optional[HashimotoConfig], job_url: Optional[str]) -> HashimotoConfig:
+        """job_url이 주어지면 공고를 분석해 focus_keywords를 config에 채운다.
+
+        키워드는 부가 메타정보이므로, fetch/분석 실패 시 세션을 막지 않고
+        경고만 출력한 뒤 빈 목록으로 진행한다.
+        """
+        config = config or HashimotoConfig()
+        if not job_url:
+            return config
+        from llm.job_analyzer import extract_focus_keywords_from_url
+        try:
+            keywords = extract_focus_keywords_from_url(job_url)
+        except Exception as e:
+            print(f"[Hashimoto] 공고 키워드 도출 실패 — 키워드 없이 진행합니다: {e}")
+            keywords = []
+        return config.model_copy(update={"focus_keywords": keywords})
+
     @classmethod
     def from_topics(
         cls,
         topics: List[str],
         config: Optional[HashimotoConfig] = None,
+        job_url: Optional[str] = None,
     ) -> "HashimotoEngine":
-        """주제 목록을 직접 지정하여 엔진을 초기화한다. 첫 주제가 root, 나머지는 큐."""
+        """주제 목록을 직접 지정하여 엔진을 초기화한다. 첫 주제가 root, 나머지는 큐.
+
+        job_url을 주면 공고를 분석해 세션 집중 키워드를 config.focus_keywords에 채운다.
+        """
         if not topics:
             raise ValueError("topics는 최소 1개 이상이어야 합니다.")
+        config = cls._apply_job_url(config, job_url)
         return cls(root_topic=topics[0], topic_queue=topics[1:], config=config)
 
     @classmethod
@@ -68,9 +91,14 @@ class HashimotoEngine:
         resume_text: str,
         topic_count: int = 3,
         config: Optional[HashimotoConfig] = None,
+        job_url: Optional[str] = None,
     ) -> "HashimotoEngine":
-        """자기소개서를 분석하여 topic_count개의 root_topic을 생성하고 엔진을 초기화한다."""
+        """자기소개서를 분석하여 topic_count개의 root_topic을 생성하고 엔진을 초기화한다.
+
+        job_url을 주면 공고를 분석해 세션 집중 키워드를 config.focus_keywords에 채운다.
+        """
         topics = extract_topics(resume_text, topic_count)
+        config = cls._apply_job_url(config, job_url)
         return cls(root_topic=topics[0], topic_queue=topics[1:], config=config)
 
     # ── Properties ────────────────────────────────────────────────────────────
@@ -192,6 +220,7 @@ class HashimotoEngine:
             topic_changed=topic_changed,
             transition_hint=transition_hint,
             resolved_history=resolved_history_list(self._verified_archive, self._refused_archive),
+            focus_keywords=self.config.focus_keywords,
         )
 
     def reset(self, new_topic: str) -> None:

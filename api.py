@@ -14,6 +14,8 @@ class InitRequest(BaseModel):
     topic_count: int = 3
     # 세션 단위 튜닝 (미지정 시 기본값)
     config: Optional[HashimotoConfig] = None
+    # 채용공고 URL — 주면 공고를 분석해 세션 집중 키워드를 도출 (부가 메타정보)
+    job_url: Optional[str] = None
 
 class ProcessTurnRequest(BaseModel):
     stt_text: str
@@ -29,15 +31,22 @@ def init_engine(request: InitRequest):
     global engine
     try:
         if request.topics:
-            engine = HashimotoEngine.from_topics(request.topics, config=request.config)
+            engine = HashimotoEngine.from_topics(
+                request.topics, config=request.config, job_url=request.job_url
+            )
         elif request.resume_text:
             engine = HashimotoEngine.from_resume(
-                request.resume_text, topic_count=request.topic_count, config=request.config
+                request.resume_text, topic_count=request.topic_count,
+                config=request.config, job_url=request.job_url,
             )
         else:
             raise HTTPException(status_code=400, detail="resume_text 또는 topics 중 하나가 필요합니다.")
         topics = [engine.current_topic] + engine.remaining_topics
-        return {"topics": topics, "current_topic": engine.current_topic}
+        return {
+            "topics": topics,
+            "current_topic": engine.current_topic,
+            "focus_keywords": engine.config.focus_keywords,
+        }
     except HTTPException:
         raise
     except Exception as e:

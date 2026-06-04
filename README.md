@@ -70,6 +70,28 @@ HashimotoEngine(
 )
 ```
 
+### 채용공고 기반 집중 키워드 (선택)
+
+엔진 인스턴스 시 `job_url`을 함께 넘기면, 공고를 1회 분석하여 **세션 집중 키워드**를 도출합니다. 이 키워드는 **엔진 내부 로직에서 직접 사용되지 않으며**, `SapienStrategyPackage`의 부가 메타정보(`current_context.focus_keywords`)로만 전달되어 질문 LLM이 참고합니다.
+
+```python
+engine = HashimotoEngine.from_resume(resume_text, topic_count=3, job_url="https://.../jd")
+print(engine.config.focus_keywords)
+# ['대용량 트래픽 처리', 'MSA', '분산 트랜잭션', 'Kafka', 'SRE', ...]
+```
+
+```
+job_url
+   │
+   ▼ fetch (urllib) → HTML 본문 추출 → LLM 1회 호출 (job_analyzer.py)
+["대용량 트래픽 처리", "분산 트랜잭션", "Kafka", "SRE", ...]
+   │
+   ▼ config.focus_keywords 에 저장 (세션 불변)
+매 턴 SapienStrategyPackage.current_context.focus_keywords 로 전달
+```
+
+> URL은 정적 fetch 기반입니다. JS 렌더링/봇차단 공고는 본문을 충분히 얻지 못할 수 있으며, 그 경우 **키워드 없이 세션이 정상 진행**됩니다(부가 메타정보이므로 실패해도 면접을 막지 않음). 이미 도출한 키워드를 직접 넘기려면 `HashimotoConfig(focus_keywords=[...])`를 사용합니다.
+
 ---
 
 ## 처리 흐름
@@ -161,7 +183,8 @@ hashimoto/
     ├── prompts.py                 # 시스템 프롬프트 + 턴 메시지 빌더
     ├── client.py                  # 동기 Gemini SDK 래퍼 (structured output)
     ├── async_client.py            # 비동기 Gemini SDK 래퍼 (structured output)
-    └── topic_extractor.py         # 자기소개서 → root_topic 추출
+    ├── topic_extractor.py         # 자기소개서 → root_topic 추출
+    └── job_analyzer.py            # 채용공고 URL → 세션 집중 키워드 추출
 ```
 
 ### 파일별 역할
@@ -216,6 +239,7 @@ config = HashimotoConfig(
     active_window=3,                # Multi-Slot Scanning 윈도우 크기
     anxiety_adjust=True,            # 불안도에 따른 depth 임계값 자동 하향
     analysis_model=None,            # 분석 LLM 모델 오버라이드 (None=기본)
+    focus_keywords=[],              # 채용공고 집중 키워드 (부가 메타정보, 엔진 로직 미사용)
 )
 ```
 
@@ -420,7 +444,8 @@ asyncio.run(run())
     "multimodal_feedback_requirement": null,
     "resolved_history": [
       {"proposition": "Redux와 Context API의 선택 기준은?", "status": "검증됨"}
-    ]
+    ],
+    "focus_keywords": ["대용량 트래픽 처리", "분산 트랜잭션", "Kafka"]
   }
 }
 ```
@@ -431,6 +456,7 @@ asyncio.run(run())
 | `transition_hint` | `"direction_change"`이면 within-topic depth prune 발생. Sapien이 "잘 알겠습니다" / "자, 그러면" 등 추임새 삽입 권장. `null`이면 일반 진행 |
 | `multimodal_feedback_requirement` | 불안도 > 70 또는 자신감 < 30일 때 자동으로 채워져 Sapien의 어조 조정을 유도 |
 | `resolved_history` | 이미 검증·거부된 명제 목록(`proposition`+`status`). 질문 생성 시 재질문을 피하도록 참고. 빈 배열일 수 있음 |
+| `focus_keywords` | 채용공고 기반 세션 집중 키워드. 질문 LLM이 검증 방향을 정렬하는 데 참고하는 **부가 메타정보**. 엔진 내부 로직은 사용하지 않음. 빈 배열일 수 있음 |
 
 ### 아카이브 접근
 

@@ -288,6 +288,11 @@ def build_question_prompt(package: SapienStrategyPackage) -> str:
     if c.get("multimodal_feedback_requirement"):
         lines.append(f"[피드백 요구] {c['multimodal_feedback_requirement']}")
 
+    keywords = c.get("focus_keywords") or []
+    if keywords:
+        lines.append("")
+        lines.append(f"[채용공고 집중 키워드] {', '.join(keywords)}")
+
     resolved = c.get("resolved_history") or []
     if resolved:
         lines.append("")

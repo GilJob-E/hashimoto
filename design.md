@@ -184,7 +184,7 @@ types.GenerateContentConfig(system_instruction=_SYSTEM)
 
 ## 9. 출력 스키마: SapienStrategyPackage
 
-**결정**: `interaction_strategy.current_context`에는 반드시 `topic`, `depth_level`, `topic_changed`, `transition_hint`, `multimodal_feedback_requirement`, `resolved_history` 여섯 필드가 포함된다.
+**결정**: `interaction_strategy.current_context`에는 반드시 `topic`, `depth_level`, `topic_changed`, `transition_hint`, `multimodal_feedback_requirement`, `resolved_history`, `focus_keywords` 일곱 필드가 포함된다.
 
 **구현 위치**: `models/io.py` → `SapienStrategyPackage.from_analysis()`
 
@@ -193,6 +193,7 @@ types.GenerateContentConfig(system_instruction=_SYSTEM)
 - `transition_hint` 필드를 제거하지 않는다. `"direction_change"` 값은 Sapien이 "잘 알겠습니다" / "자, 그러면" 등의 추임새를 삽입하는 신호다. `None`이면 추임새 없음.
 - `multimodal_feedback_requirement`의 자동 생성 로직(anxiety > 70, confidence < 30)을 삭제하지 않는다.
 - `resolved_history` 필드를 제거하지 않는다. 질문 LLM의 재질문 방지에 사용한다(§13).
+- `focus_keywords` 필드를 제거하지 않는다. 채용공고 기반 세션 집중 키워드 메타정보다(§14).
 - `from_analysis()`의 `topic_changed` 파라미터 기본값은 `False`를 유지한다.
 - `from_analysis()`의 `transition_hint` 파라미터 기본값은 `None`을 유지한다.
 
@@ -318,6 +319,21 @@ turn N+1: to_context_str()가 Derived From + Evidence(부모 명제 + 기존 근
 
 ---
 
+## 14. 채용공고 집중 키워드 (메타정보 전용)
+
+**결정**: 엔진 인스턴스 시 `job_url`을 받으면 공고를 분석해 세션 집중 키워드를 도출한다. 이 키워드는 **엔진 내부 로직에서 직접 사용되지 않으며**, `SapienStrategyPackage.current_context.focus_keywords`의 부가 메타정보로만 전달된다(career-ops의 JD 분석 접근을 단순화 차용).
+
+**구현 위치**: `llm/job_analyzer.py` → `fetch_job_posting()`, `derive_focus_keywords()`, `extract_focus_keywords_from_url()`; `models/io.py` → `HashimotoConfig.focus_keywords`, `SapienStrategyPackage.from_analysis(focus_keywords=...)`; 두 엔진의 `from_resume()`/`from_topics()` `job_url` 파라미터 + `_apply_job_url()`.
+
+**불변 조건**
+- 키워드는 인스턴스 시 **1회만** 도출한다(`extract_topics`와 동일 패턴). 턴 루프 안에서 공고를 다시 분석하지 않는다.
+- 엔진의 분석 경로(`build_turn_message`/`analyze_turn`/상태 전이)는 `focus_keywords`를 **참조하지 않는다**. PRUNE·가추 등 어떤 판정에도 사용하지 않는다. 오직 `from_analysis()`에서 패키지 메타정보로 싣기만 한다.
+- 키워드는 세션 동안 불변이며 `HashimotoConfig.focus_keywords`에 보관한다. 이미 도출한 키워드를 직접 주입할 수도 있다(`HashimotoConfig(focus_keywords=[...])`).
+- 공고 fetch/분석은 **부가 기능**이므로 실패 시 세션을 막지 않는다. 예외를 잡아 경고 후 `focus_keywords=[]`로 진행한다.
+- 정적 fetch(`urllib`) 기반이므로 외부 의존성(Playwright 등)을 추가하지 않는다. JS 렌더링 공고의 본문 누락은 빈 키워드로 degrade된다.
+
+---
+
 ## 변경 시 체크리스트
 
 새 기능을 추가하거나 기존 코드를 수정할 때 아래를 확인한다.
@@ -352,6 +368,8 @@ turn N+1: to_context_str()가 Derived From + Evidence(부모 명제 + 기존 근
 - [ ] `effective_depth_threshold` / `should_switch_topic`에 config 값을 전달하는가? (모듈 상수 직접 사용 금지)
 - [ ] `resolved_context`를 분석 LLM 호출 **전**, `resolved_history`를 해소분 적재 **후** 패키지에 싣는가? (§13)
 - [ ] `SYSTEM_PROMPT`의 재질문 금지 지침과 `current_context.resolved_history`가 유지되는가?
+- [ ] `focus_keywords`가 엔진 판정 로직에 쓰이지 않고 `from_analysis()` 메타정보로만 전달되는가? (§14)
+- [ ] `job_url` 분석 실패가 세션을 막지 않고 빈 키워드로 degrade되는가?
 
 **아키텍처**
 - [ ] `LowLatencyHashimotoEngine`의 워커가 단일 태스크인가?
