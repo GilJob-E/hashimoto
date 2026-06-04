@@ -25,7 +25,7 @@
 
 Hashimoto는 두 가지 모드로 사용할 수 있습니다.
 
-| | 표준 모드 (`HashimotoEngine`) | 저지연 모드 (`LowLatencyHashimotoEngine`) |
+| | 표준 모드 (`HashimotoEngine`) | 비동기 모드 (`LowLatencyHashimotoEngine`) |
 |---|---|---|
 | 처리 방식 | 동기, 블로킹 | 비동기, non-blocking |
 | Sapien 대기 | 분석 완료까지 대기 | 대기 없음, 즉시 반환 |
@@ -51,7 +51,7 @@ engine = HashimotoEngine(root_topic="React 상태관리 경험")
 # 동기 (표준 모드)
 engine = HashimotoEngine.from_resume(resume_text, topic_count=3)
 
-# 비동기 (저지연 모드)
+# 비동기 모드
 engine = LowLatencyHashimotoEngine.from_resume(resume_text, topic_count=3)
 ```
 
@@ -117,7 +117,7 @@ HashimotoEngine(
 6. SapienStrategyPackage 생성 및 반환
 ```
 
-### 저지연 모드 (비동기 병렬)
+### 비동기 모드 (병렬 파이프라인)
 
 Hashimoto의 분석이 Sapien의 질문 생성을 블로킹하지 않습니다. strategy는 항상 직전 턴까지의 최신 분석 결과입니다.
 
@@ -276,6 +276,8 @@ engine = LowLatencyHashimotoEngine.from_resume(
 - `SYSTEM_PROMPT`: 역할 정의 + 출력 필드 설명 + 판단 기준 + **재질문 금지 지침**. JSON 구조 자체는 `response_schema`가 강제하므로 스키마 예시는 포함하지 않습니다. **캐싱 대상(안정적 접두사)**이므로 동적 값을 포함하지 않습니다.
 - `build_turn_message()`: 매 턴마다 STT, 활성 슬롯, **이미 해소된 명제**(재질문 방지), Depth_Counter, 멀티모달 신호를 주입합니다.
 
+> **재질문 금지 범위**: "이미 해소된 명제"에는 **검증 완료(`verified_archive`)** 슬롯뿐 아니라 **사용자가 답변을 거부한(`refused_archive`)** 슬롯도 포함됩니다. 두 아카이브 모두 매 턴 분석 LLM(`[이미 해소된 명제]` 블록)과 질문 LLM(`current_context.resolved_history`)에 `검증됨`/`거부됨` 상태와 함께 전달되므로, 이미 답한 질문은 물론 **답변을 거부한 질문도 다시 묻지 않습니다**. (구현: `resolved_context_str()` / `resolved_history_list()`가 `verified_archive` + `refused_archive`를 함께 요약)
+
 ---
 
 ## LLM 출력 스키마
@@ -371,7 +373,7 @@ result = engine.process_turn(
 print(result.interaction_strategy)
 ```
 
-### 5. 저지연 모드 코드 예시
+### 5. 비동기 모드 코드 예시
 
 ```python
 import asyncio
