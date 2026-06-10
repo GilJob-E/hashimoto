@@ -35,6 +35,9 @@ class HashimotoConfig(BaseModel):
     anxiety_adjust: bool = True
     # 분석 LLM 모델 오버라이드 (None이면 클라이언트 기본 모델)
     analysis_model: Optional[str] = None
+    # 채용공고에서 도출한 세션 집중 키워드. 엔진 로직에서 직접 쓰이지 않고
+    # SapienStrategyPackage의 부가 메타정보로만 전달된다.
+    focus_keywords: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_bounds(self) -> "HashimotoConfig":
@@ -113,6 +116,7 @@ class SapienStrategyPackage(BaseModel):
         topic_changed: bool = False,
         transition_hint: Optional[str] = None,
         resolved_history: Optional[List[Dict[str, Any]]] = None,
+        focus_keywords: Optional[List[str]] = None,
     ) -> "SapienStrategyPackage":
         adjust_note = ""
         if multimodal.anxiety > 70:
@@ -137,6 +141,8 @@ class SapienStrategyPackage(BaseModel):
                     "multimodal_feedback_requirement": adjust_note or None,
                     # 이미 검증/거부된 명제 — 질문 LLM이 재질문하지 않도록 전달
                     "resolved_history": resolved_history or [],
+                    # 채용공고 기반 세션 집중 키워드 (부가 메타정보)
+                    "focus_keywords": focus_keywords or [],
                 },
             }
         )
